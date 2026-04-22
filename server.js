@@ -2,6 +2,7 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { URL } = require('url');
+const { FREE_QUOTA, KEYS_SET, fingerprint, getQuotaStore } = require('./quota-store');
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -435,6 +436,103 @@ async function handleGenerate(req, res) {
   }
 }
 
+async function handleKeys(req, res) {
+  try {
+    const raw = await readRequestBody(req);
+    const body = parseJsonBody(raw);
+    const action = String(body.action || '').trim();
+    const key = String(body.key || '').trim();
+    const store = await getQuotaStore();
+
+    if (!store) {
+      if (action === 'check_free') {
+        sendJson(res, 200, { free: true, mock: true });
+        return;
+      }
+
+      if (action === 'validate') {
+        sendJson(res, 200, { valid: true, mock: true });
+        return;
+      }
+
+      sendJson(res, 200, { ok: true, mock: true });
+      return;
+    }
+
+    if (action === 'check_free') {
+      const used = Number((await store.get(fingerprint(req))) || 0);
+      sendJson(res, 200, { free: used < FREE_QUOTA });
+      return;
+    }
+
+    if (action === 'consume_free') {
+      const freeKey = fingerprint(req);
+      const used = Number((await store.get(freeKey)) || 0);
+
+      if (used >= FREE_QUOTA) {
+        sendJson(res, 403, { error: 'free_exhausted' });
+        return;
+      }
+
+      await store.incr(freeKey);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (action === 'validate') {
+      if (!key) {
+        sendJson(res, 400, { valid: false, error: '请输入密钥' });
+        return;
+      }
+
+      const exists = await store.sismember(KEYS_SET, key);
+      sendJson(res, 200, { valid: !!exists });
+      return;
+    }
+
+    if (action === 'consume') {
+      if (!key) {
+        sendJson(res, 400, { error: '请输入密钥' });
+        return;
+      }
+
+      const removed = await store.srem(KEYS_SET, key);
+      if (!removed) {
+        sendJson(res, 403, { error: '密钥无效或已使用' });
+        return;
+      }
+
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (action === 'import') {
+      if (!requireAdmin(req)) {
+        sendJson(res, 401, { error: 'Unauthorized' });
+        return;
+      }
+
+      const keys = Array.isArray(body.keys) ? body.keys.map((item) => String(item).trim()).filter(Boolean) : [];
+      if (keys.length === 0) {
+        sendJson(res, 400, { error: 'keys array required' });
+        return;
+      }
+
+      await store.sadd(KEYS_SET, ...keys);
+      const total = await store.scard(KEYS_SET);
+      sendJson(res, 200, { imported: keys.length, total });
+      return;
+    }
+
+    sendJson(res, 400, { error: 'Invalid action' });
+  } catch (error) {
+    sendJson(res, 500, {
+      ok: false,
+      error: String(error)
+    });
+  }
+}
+
 async function handleUpdateProviders(req, res) {
   if (!requireAdmin(req)) {
     sendJson(res, 401, { ok: false, error: 'unauthorized' });
@@ -506,6 +604,16 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && parsedUrl.pathname === '/api/generate-image') {
     await handleGenerate(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/generate') {
+    await handleGenerate(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/keys') {
+    await handleKeys(req, res);
     return;
   }
 
