@@ -19,6 +19,12 @@
       "enabled": true
     },
     {
+      "name": "custom",
+      "url": "https://way.ydata.vip/v1/responses",
+      "apiKey": "sk-rTVwmyPZ2b8QRmC57NZA9rbrxnzGggAfrXWBkm7B4s4SYzac",
+      "enabled": true
+    },
+    {
       "name": "customer",
       "url": "https://api.asxs.top/v1/responses",
       "apiKey": "sk-95b70322424b7387df95fed6b285ae6c",
