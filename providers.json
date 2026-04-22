@@ -1,0 +1,26 @@
+{
+  "roundRobinIndex": 0,
+  "request": {
+    "model": "gpt-5.4",
+    "imageModel": "gpt-image-2",
+    "size": "1024x1536",
+    "quality": "high",
+    "outputFormat": "png",
+    "retriesPerProvider": 2,
+    "timeoutMs": 180000
+  },
+  "providers": [
+    {
+      "name": "1024token",
+      "url": "https://1024token.one/v1/responses",
+      "apiKey": "sk-4df7d665507c5345513de511d05bde915b566996f251a66f3f82e28fbc927fab",
+      "enabled": true
+    },
+    {
+      "name": "asxs",
+      "url": "https://api.asxs.top/openai/v1/responses",
+      "apiKey": "sk-95b70322424b7387df95fed6b285ae6c",
+      "enabled": true
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.tmp
+*.log
+node_modules/
