@@ -19,8 +19,8 @@
       "enabled": true
     },
     {
-      "name": "asxs",
-      "url": "https://api.asxs.top/openai/v1/responses",
+      "name": "customer",
+      "url": "https://api.asxs.top/v1/responses",
       "apiKey": "sk-95b70322424b7387df95fed6b285ae6c",
       "enabled": true
     }
