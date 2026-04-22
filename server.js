@@ -189,6 +189,11 @@ function uniqueStrings(values) {
   return list;
 }
 
+function delay(ms) {
+  if (!ms || ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function buildResponseEndpoints(provider) {
   const raw = String(provider.url || provider.baseUrl || '').trim();
   const normalized = raw.replace(/\/+$/, '');
@@ -348,34 +353,41 @@ async function generateImageWithFallback(prompt) {
   const orderedProviders = rotateProviders(enabledProviders, config.roundRobinIndex);
   const attempts = [];
   const retriesPerProvider = Math.max(1, Number.parseInt(String(config.request.retriesPerProvider || 1), 10));
+  const retryRounds = Math.max(1, Number.parseInt(String(config.request.retryRounds || 1), 10));
+  const retryDelayMs = Math.max(0, Number.parseInt(String(config.request.retryDelayMs || 0), 10));
 
-  for (let providerIndex = 0; providerIndex < orderedProviders.length; providerIndex += 1) {
-    const provider = orderedProviders[providerIndex];
-    for (let retry = 0; retry < retriesPerProvider; retry += 1) {
-      const result = await tryProvider(provider, prompt, config.request);
-      attempts.push({
-        provider: result.provider,
-        endpoint: result.endpoint,
-        ok: result.ok,
-        status: result.status || null,
-        retry: retry + 1,
-        meta: result.meta || null,
-        error: result.error || result.body || result.sse || null
-      });
+  for (let round = 0; round < retryRounds; round += 1) {
+    for (let providerIndex = 0; providerIndex < orderedProviders.length; providerIndex += 1) {
+      const provider = orderedProviders[providerIndex];
+      for (let retry = 0; retry < retriesPerProvider; retry += 1) {
+        const result = await tryProvider(provider, prompt, config.request);
+        attempts.push({
+          provider: result.provider,
+          endpoint: result.endpoint,
+          ok: result.ok,
+          status: result.status || null,
+          round: round + 1,
+          retry: retry + 1,
+          meta: result.meta || null,
+          error: result.error || result.body || result.sse || null
+        });
 
-      if (result.ok) {
-        const providerPosition = enabledProviders.findIndex((item) => item.name === provider.name && item.url === provider.url);
-        if (providerPosition >= 0) {
-          config.roundRobinIndex = (providerPosition + 1) % enabledProviders.length;
-          writeConfig(config);
+        if (result.ok) {
+          const providerPosition = enabledProviders.findIndex((item) => item.name === provider.name && item.url === provider.url);
+          if (providerPosition >= 0) {
+            config.roundRobinIndex = (providerPosition + 1) % enabledProviders.length;
+            writeConfig(config);
+          }
+          return {
+            ok: true,
+            buffer: result.imageBuffer,
+            provider: provider.name,
+            attempts,
+            meta: result.meta
+          };
         }
-        return {
-          ok: true,
-          buffer: result.imageBuffer,
-          provider: provider.name,
-          attempts,
-          meta: result.meta
-        };
+
+        await delay(retryDelayMs);
       }
     }
   }
