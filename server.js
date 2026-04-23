@@ -7,7 +7,12 @@ const { FREE_QUOTA, KEYS_SET, fingerprint, getQuotaStore } = require('./quota-st
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
-const CONFIG_PATH = path.join(__dirname, 'providers.json');
+const CONFIG_PATH = process.env.PROVIDERS_CONFIG_PATH || path.join(__dirname, 'providers.json');
+const PREFERRED_PROVIDER_NAMES = ['1024token', 'custom'];
+const MODEL_CAPACITY_ERROR = '当前模型资源有点紧张，请稍后再试一次。';
+const REQUEST_DEADLINE_EXCEEDED_ERROR = 'Request deadline exceeded';
+const DEFAULT_PROVIDER_TIMEOUT_MS = 65000;
+const DEFAULT_MAX_TOTAL_DURATION_MS = 110000;
 
 function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload, null, 2);
@@ -92,6 +97,107 @@ function rotateProviders(providers, startIndex) {
   if (providers.length === 0) return [];
   const offset = ((startIndex % providers.length) + providers.length) % providers.length;
   return providers.map((_, index) => providers[(offset + index) % providers.length]);
+}
+
+function prioritizeProviders(providers) {
+  const remaining = [...providers];
+  const prioritized = [];
+
+  for (const name of PREFERRED_PROVIDER_NAMES) {
+    const index = remaining.findIndex((provider) => provider.name === name);
+    if (index < 0) continue;
+    prioritized.push(remaining[index]);
+    remaining.splice(index, 1);
+  }
+
+  return prioritized.concat(remaining);
+}
+
+function summarizeAttemptError(error) {
+  if (!error) return null;
+  if (typeof error === 'string') return error.slice(0, 200);
+  if (error.error && typeof error.error === 'string') return error.error.slice(0, 200);
+  if (error.body && typeof error.body === 'string') return error.body.slice(0, 200);
+  if (error.sse && error.sse.error) return JSON.stringify(error.sse.error).slice(0, 200);
+  return JSON.stringify(error).slice(0, 200);
+}
+
+function readInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getProviderKey(provider) {
+  return `${provider.name}::${provider.url}`;
+}
+
+function isRetryableStatus(status) {
+  if (!Number.isFinite(status)) return false;
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function isRetryableAttemptFailure(result) {
+  if (!result || result.ok) return false;
+  if (Number.isFinite(result.status)) {
+    return isRetryableStatus(result.status);
+  }
+
+  const summary = String(summarizeAttemptError(result.error || result.body || result.sse || '') || '').toLowerCase();
+  if (!summary) {
+    return false;
+  }
+
+  if (
+    summary.includes('invalid_api_key') ||
+    summary.includes('incorrect api key') ||
+    summary.includes('unauthorized') ||
+    summary.includes('forbidden') ||
+    summary.includes('not found') ||
+    summary.includes('unsupported') ||
+    summary.includes('invalid model') ||
+    summary.includes('insufficient credits')
+  ) {
+    return false;
+  }
+
+  return (
+    summary.includes('timed out') ||
+    summary.includes('timeout') ||
+    summary.includes('rate limit') ||
+    summary.includes('capacity') ||
+    summary.includes('overloaded') ||
+    summary.includes('temporar') ||
+    summary.includes('unavailable') ||
+    summary.includes('fetch failed') ||
+    summary.includes('network') ||
+    summary.includes('connection') ||
+    summary.includes('socket') ||
+    summary.includes('econn') ||
+    summary.includes('aborted')
+  );
+}
+
+function buildGenerationFailure(result) {
+  if (
+    result.error === 'All providers failed' ||
+    result.error === REQUEST_DEADLINE_EXCEEDED_ERROR
+  ) {
+    return {
+      statusCode: 503,
+      error: MODEL_CAPACITY_ERROR,
+      errorCode: 'model_capacity',
+      retryable: true
+    };
+  }
+
+  if (result.error !== 'All providers failed') {
+    return {
+      statusCode: result.statusCode || 500,
+      error: result.error,
+      errorCode: 'generate_failed',
+      retryable: false
+    };
+  }
 }
 
 async function readSseResult(response) {
@@ -232,7 +338,7 @@ async function tryProvider(provider, prompt, requestConfig) {
     stream: true
   };
 
-  const timeoutMs = Number.isFinite(requestConfig.timeoutMs) ? requestConfig.timeoutMs : 180000;
+  const timeoutMs = Number.isFinite(requestConfig.timeoutMs) ? requestConfig.timeoutMs : DEFAULT_PROVIDER_TIMEOUT_MS;
   const endpoints = buildResponseEndpoints(provider);
   let lastFailure = null;
 
@@ -261,7 +367,8 @@ async function tryProvider(provider, prompt, requestConfig) {
           endpoint,
           status: response.status,
           contentType,
-          body: (await response.text()).slice(0, 2000)
+          body: (await response.text()).slice(0, 2000),
+          retryable: isRetryableStatus(response.status)
         };
         continue;
       }
@@ -273,7 +380,8 @@ async function tryProvider(provider, prompt, requestConfig) {
           endpoint,
           status: response.status,
           contentType,
-          body: (await response.text()).slice(0, 2000)
+          body: (await response.text()).slice(0, 2000),
+          retryable: false
         };
         continue;
       }
@@ -302,7 +410,8 @@ async function tryProvider(provider, prompt, requestConfig) {
               : null,
             outputText: sse.outputText || '',
             error: sse.error
-          }
+          },
+          retryable: isRetryableAttemptFailure({ sse })
         };
         continue;
       }
@@ -324,6 +433,19 @@ async function tryProvider(provider, prompt, requestConfig) {
           }
         }
       };
+    } catch (error) {
+      lastFailure = {
+        ok: false,
+        provider: provider.name,
+        endpoint,
+        status: null,
+        contentType: null,
+        error: error && error.name === 'AbortError'
+          ? `Request timed out after ${timeoutMs}ms`
+          : String(error),
+        retryable: true
+      };
+      continue;
     } finally {
       clearTimeout(timer);
     }
@@ -335,7 +457,8 @@ async function tryProvider(provider, prompt, requestConfig) {
     endpoint: endpoints[0] || '',
     status: null,
     contentType: null,
-    body: 'No valid endpoint candidates'
+    body: 'No valid endpoint candidates',
+    retryable: false
   };
 }
 
@@ -351,17 +474,43 @@ async function generateImageWithFallback(prompt) {
     };
   }
 
-  const orderedProviders = rotateProviders(enabledProviders, config.roundRobinIndex);
+  const orderedProviders = prioritizeProviders(rotateProviders(enabledProviders, config.roundRobinIndex));
   const attempts = [];
-  const retriesPerProvider = Math.max(1, Number.parseInt(String(config.request.retriesPerProvider || 1), 10));
-  const retryRounds = Math.max(1, Number.parseInt(String(config.request.retryRounds || 1), 10));
-  const retryDelayMs = Math.max(0, Number.parseInt(String(config.request.retryDelayMs || 0), 10));
+  const retriesPerProvider = Math.max(1, readInteger(config.request.retriesPerProvider, 1));
+  const retryRounds = Math.max(1, readInteger(config.request.retryRounds, 1));
+  const retryDelayMs = Math.max(0, readInteger(config.request.retryDelayMs, 0));
+  const providerTimeoutMs = Math.max(1, readInteger(config.request.timeoutMs, DEFAULT_PROVIDER_TIMEOUT_MS));
+  const maxTotalDurationMs = Math.max(
+    providerTimeoutMs,
+    readInteger(config.request.maxTotalDurationMs, DEFAULT_MAX_TOTAL_DURATION_MS)
+  );
+  const deadlineAt = Date.now() + maxTotalDurationMs;
+  const exhaustedProviders = new Set();
 
   for (let round = 0; round < retryRounds; round += 1) {
     for (let providerIndex = 0; providerIndex < orderedProviders.length; providerIndex += 1) {
       const provider = orderedProviders[providerIndex];
+      const providerKey = getProviderKey(provider);
+      if (exhaustedProviders.has(providerKey)) {
+        continue;
+      }
+
       for (let retry = 0; retry < retriesPerProvider; retry += 1) {
-        const result = await tryProvider(provider, prompt, config.request);
+        const remainingMs = deadlineAt - Date.now();
+        if (remainingMs <= 0) {
+          return {
+            ok: false,
+            statusCode: 503,
+            error: REQUEST_DEADLINE_EXCEEDED_ERROR,
+            attempts
+          };
+        }
+
+        const attemptTimeoutMs = Math.max(1, Math.min(providerTimeoutMs, remainingMs));
+        const result = await tryProvider(provider, prompt, {
+          ...config.request,
+          timeoutMs: attemptTimeoutMs
+        });
         attempts.push({
           provider: result.provider,
           endpoint: result.endpoint,
@@ -369,6 +518,8 @@ async function generateImageWithFallback(prompt) {
           status: result.status || null,
           round: round + 1,
           retry: retry + 1,
+          timeoutMs: attemptTimeoutMs,
+          retryable: result.retryable !== false,
           meta: result.meta || null,
           error: result.error || result.body || result.sse || null
         });
@@ -388,7 +539,15 @@ async function generateImageWithFallback(prompt) {
           };
         }
 
-        await delay(retryDelayMs);
+        if (result.retryable === false) {
+          exhaustedProviders.add(providerKey);
+          break;
+        }
+
+        const delayMs = Math.min(retryDelayMs, Math.max(0, deadlineAt - Date.now()));
+        if (retry < retriesPerProvider - 1 && delayMs > 0) {
+          await delay(delayMs);
+        }
       }
     }
   }
@@ -414,9 +573,23 @@ async function handleGenerate(req, res) {
 
     const result = await generateImageWithFallback(prompt);
     if (!result.ok) {
-      sendJson(res, result.statusCode || 500, {
-        ok: false,
+      const failure = buildGenerationFailure(result);
+      console.error('[generate] request failed', JSON.stringify({
         error: result.error,
+        attempts: result.attempts.map((attempt) => ({
+          provider: attempt.provider,
+          status: attempt.status,
+          round: attempt.round,
+          retry: attempt.retry,
+          error: summarizeAttemptError(attempt.error)
+        }))
+      }));
+
+      sendJson(res, failure.statusCode, {
+        ok: false,
+        error: failure.error,
+        errorCode: failure.errorCode,
+        retryable: failure.retryable,
         attempts: result.attempts
       });
       return;

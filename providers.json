@@ -6,10 +6,11 @@
     "size": "1024x1536",
     "quality": "high",
     "outputFormat": "png",
-    "retriesPerProvider": 2,
-    "retryRounds": 2,
-    "retryDelayMs": 800,
-    "timeoutMs": 180000
+    "retriesPerProvider": 1,
+    "retryRounds": 1,
+    "retryDelayMs": 500,
+    "timeoutMs": 65000,
+    "maxTotalDurationMs": 110000
   },
   "providers": [
     {
