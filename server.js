@@ -177,6 +177,15 @@ function isRetryableAttemptFailure(result) {
   );
 }
 
+function isTimeoutFailure(result) {
+  const summary = String(summarizeAttemptError(result && (result.error || result.body || result.sse || '')) || '');
+  return summary.includes('Request timed out after');
+}
+
+function shouldStopAfterFailure(result, requestConfig) {
+  return Boolean(requestConfig && requestConfig.stopOnTimeout === true && isTimeoutFailure(result));
+}
+
 function buildGenerationFailure(result) {
   if (
     result.error === 'All providers failed' ||
@@ -536,6 +545,15 @@ async function generateImageWithFallback(prompt) {
             provider: provider.name,
             attempts,
             meta: result.meta
+          };
+        }
+
+        if (shouldStopAfterFailure(result, config.request)) {
+          return {
+            ok: false,
+            statusCode: 503,
+            error: REQUEST_DEADLINE_EXCEEDED_ERROR,
+            attempts
           };
         }
 
