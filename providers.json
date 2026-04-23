@@ -9,8 +9,8 @@
     "retriesPerProvider": 1,
     "retryRounds": 1,
     "retryDelayMs": 500,
-    "timeoutMs": 65000,
-    "maxTotalDurationMs": 110000
+    "timeoutMs": 75000,
+    "maxTotalDurationMs": 120000
   },
   "providers": [
     {
