@@ -8,7 +8,7 @@ const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const CONFIG_PATH = process.env.PROVIDERS_CONFIG_PATH || path.join(__dirname, 'providers.json');
-const PREFERRED_PROVIDER_NAMES = ['1024token', 'custom'];
+const DEFAULT_PREFERRED_PROVIDER_NAMES = ['1024token', 'custom'];
 const MODEL_CAPACITY_ERROR = '当前模型资源有点紧张，请稍后再试一次。';
 
 function sendJson(res, statusCode, payload) {
@@ -96,11 +96,16 @@ function rotateProviders(providers, startIndex) {
   return providers.map((_, index) => providers[(offset + index) % providers.length]);
 }
 
-function prioritizeProviders(providers) {
+function normalizeProviderNames(values) {
+  if (!Array.isArray(values)) return [];
+  return uniqueStrings(values.map((value) => String(value || '').trim()).filter(Boolean));
+}
+
+function prioritizeProviders(providers, preferredProviderNames = DEFAULT_PREFERRED_PROVIDER_NAMES) {
   const remaining = [...providers];
   const prioritized = [];
 
-  for (const name of PREFERRED_PROVIDER_NAMES) {
+  for (const name of normalizeProviderNames(preferredProviderNames)) {
     const index = remaining.findIndex((provider) => provider.name === name);
     if (index < 0) continue;
     prioritized.push(remaining[index]);
@@ -447,7 +452,7 @@ async function tryProvider(provider, prompt, requestConfig) {
   };
 }
 
-async function generateImageWithFallback(prompt) {
+async function generateImageWithFallback(prompt, options = {}) {
   const config = readConfig();
   const enabledProviders = config.providers.filter((provider) => provider.enabled !== false);
   if (enabledProviders.length === 0) {
@@ -459,7 +464,14 @@ async function generateImageWithFallback(prompt) {
     };
   }
 
-  const orderedProviders = prioritizeProviders(rotateProviders(enabledProviders, config.roundRobinIndex));
+  const preferredProviderNames =
+    normalizeProviderNames(options.preferredProviders).length > 0
+      ? normalizeProviderNames(options.preferredProviders)
+      : DEFAULT_PREFERRED_PROVIDER_NAMES;
+  const orderedProviders = prioritizeProviders(
+    rotateProviders(enabledProviders, config.roundRobinIndex),
+    preferredProviderNames
+  );
   const attempts = [];
   const retriesPerProvider = Math.max(1, readInteger(config.request.retriesPerProvider, 1));
   const retryRounds = Math.max(1, readInteger(config.request.retryRounds, 1));
@@ -528,13 +540,14 @@ async function handleGenerate(req, res) {
     const raw = await readRequestBody(req);
     const body = parseJsonBody(raw);
     const prompt = String(body.prompt || '').trim();
+    const preferredProviders = normalizeProviderNames(body.preferredProviders);
 
     if (!prompt) {
       sendJson(res, 400, { ok: false, error: 'prompt is required' });
       return;
     }
 
-    const result = await generateImageWithFallback(prompt);
+    const result = await generateImageWithFallback(prompt, { preferredProviders });
     if (!result.ok) {
       const failure = buildGenerationFailure(result);
       console.error('[generate] request failed', JSON.stringify({
