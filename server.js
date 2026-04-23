@@ -10,9 +10,6 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const CONFIG_PATH = process.env.PROVIDERS_CONFIG_PATH || path.join(__dirname, 'providers.json');
 const PREFERRED_PROVIDER_NAMES = ['1024token', 'custom'];
 const MODEL_CAPACITY_ERROR = '当前模型资源有点紧张，请稍后再试一次。';
-const REQUEST_DEADLINE_EXCEEDED_ERROR = 'Request deadline exceeded';
-const DEFAULT_PROVIDER_TIMEOUT_MS = 65000;
-const DEFAULT_MAX_TOTAL_DURATION_MS = 110000;
 
 function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload, null, 2);
@@ -177,20 +174,8 @@ function isRetryableAttemptFailure(result) {
   );
 }
 
-function isTimeoutFailure(result) {
-  const summary = String(summarizeAttemptError(result && (result.error || result.body || result.sse || '')) || '');
-  return summary.includes('Request timed out after');
-}
-
-function shouldStopAfterFailure(result, requestConfig) {
-  return Boolean(requestConfig && requestConfig.stopOnTimeout === true && isTimeoutFailure(result));
-}
-
 function buildGenerationFailure(result) {
-  if (
-    result.error === 'All providers failed' ||
-    result.error === REQUEST_DEADLINE_EXCEEDED_ERROR
-  ) {
+  if (result.error === 'All providers failed') {
     return {
       statusCode: 503,
       error: MODEL_CAPACITY_ERROR,
@@ -347,14 +332,10 @@ async function tryProvider(provider, prompt, requestConfig) {
     stream: true
   };
 
-  const timeoutMs = Number.isFinite(requestConfig.timeoutMs) ? requestConfig.timeoutMs : DEFAULT_PROVIDER_TIMEOUT_MS;
   const endpoints = buildResponseEndpoints(provider);
   let lastFailure = null;
 
   for (const endpoint of endpoints) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -363,8 +344,7 @@ async function tryProvider(provider, prompt, requestConfig) {
           'Content-Type': 'application/json',
           Accept: 'text/event-stream'
         },
-        body: JSON.stringify(payload),
-        signal: controller.signal
+        body: JSON.stringify(payload)
       });
 
       const contentType = response.headers.get('content-type') || '';
@@ -449,14 +429,10 @@ async function tryProvider(provider, prompt, requestConfig) {
         endpoint,
         status: null,
         contentType: null,
-        error: error && error.name === 'AbortError'
-          ? `Request timed out after ${timeoutMs}ms`
-          : String(error),
+        error: String(error),
         retryable: true
       };
       continue;
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -488,12 +464,6 @@ async function generateImageWithFallback(prompt) {
   const retriesPerProvider = Math.max(1, readInteger(config.request.retriesPerProvider, 1));
   const retryRounds = Math.max(1, readInteger(config.request.retryRounds, 1));
   const retryDelayMs = Math.max(0, readInteger(config.request.retryDelayMs, 0));
-  const providerTimeoutMs = Math.max(1, readInteger(config.request.timeoutMs, DEFAULT_PROVIDER_TIMEOUT_MS));
-  const maxTotalDurationMs = Math.max(
-    providerTimeoutMs,
-    readInteger(config.request.maxTotalDurationMs, DEFAULT_MAX_TOTAL_DURATION_MS)
-  );
-  const deadlineAt = Date.now() + maxTotalDurationMs;
   const exhaustedProviders = new Set();
 
   for (let round = 0; round < retryRounds; round += 1) {
@@ -505,21 +475,7 @@ async function generateImageWithFallback(prompt) {
       }
 
       for (let retry = 0; retry < retriesPerProvider; retry += 1) {
-        const remainingMs = deadlineAt - Date.now();
-        if (remainingMs <= 0) {
-          return {
-            ok: false,
-            statusCode: 503,
-            error: REQUEST_DEADLINE_EXCEEDED_ERROR,
-            attempts
-          };
-        }
-
-        const attemptTimeoutMs = Math.max(1, Math.min(providerTimeoutMs, remainingMs));
-        const result = await tryProvider(provider, prompt, {
-          ...config.request,
-          timeoutMs: attemptTimeoutMs
-        });
+        const result = await tryProvider(provider, prompt, config.request);
         attempts.push({
           provider: result.provider,
           endpoint: result.endpoint,
@@ -527,7 +483,6 @@ async function generateImageWithFallback(prompt) {
           status: result.status || null,
           round: round + 1,
           retry: retry + 1,
-          timeoutMs: attemptTimeoutMs,
           retryable: result.retryable !== false,
           meta: result.meta || null,
           error: result.error || result.body || result.sse || null
@@ -548,23 +503,13 @@ async function generateImageWithFallback(prompt) {
           };
         }
 
-        if (shouldStopAfterFailure(result, config.request)) {
-          return {
-            ok: false,
-            statusCode: 503,
-            error: REQUEST_DEADLINE_EXCEEDED_ERROR,
-            attempts
-          };
-        }
-
         if (result.retryable === false) {
           exhaustedProviders.add(providerKey);
           break;
         }
 
-        const delayMs = Math.min(retryDelayMs, Math.max(0, deadlineAt - Date.now()));
-        if (retry < retriesPerProvider - 1 && delayMs > 0) {
-          await delay(delayMs);
+        if (retry < retriesPerProvider - 1 && retryDelayMs > 0) {
+          await delay(retryDelayMs);
         }
       }
     }

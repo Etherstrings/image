@@ -8,10 +8,7 @@
     "outputFormat": "png",
     "retriesPerProvider": 1,
     "retryRounds": 1,
-    "retryDelayMs": 0,
-    "timeoutMs": 145000,
-    "maxTotalDurationMs": 148000,
-    "stopOnTimeout": true
+    "retryDelayMs": 0
   },
   "providers": [
     {
