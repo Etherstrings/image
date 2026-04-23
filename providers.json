@@ -1,5 +1,5 @@
 {
-  "roundRobinIndex": 0,
+  "roundRobinIndex": 1,
   "request": {
     "model": "gpt-5.4",
     "imageModel": "gpt-image-2",
@@ -9,8 +9,8 @@
     "retriesPerProvider": 1,
     "retryRounds": 1,
     "retryDelayMs": 0,
-    "timeoutMs": 115000,
-    "maxTotalDurationMs": 118000,
+    "timeoutMs": 145000,
+    "maxTotalDurationMs": 148000,
     "stopOnTimeout": true
   },
   "providers": [
