@@ -323,10 +323,18 @@ function buildJobResponse(job) {
   };
 
   if (job.status === 'succeeded' && job.imageBase64) {
-    response.imageUrl = `data:${job.mimeType || 'image/png'};base64,${job.imageBase64}`;
+    response.imageUrl = `/api/generate/jobs/${encodeURIComponent(job.id)}/image`;
   }
 
   return response;
+}
+
+function getJobImageBuffer(job) {
+  if (!job || job.status !== 'succeeded' || !job.imageBase64) {
+    return null;
+  }
+
+  return Buffer.from(job.imageBase64, 'base64');
 }
 
 function createClientAbortSignal(req, res) {
@@ -1058,6 +1066,32 @@ async function handleGetGenerateJob(req, res, jobId) {
   }
 }
 
+async function handleGetGenerateJobImage(req, res, jobId) {
+  try {
+    const job = await readJob(jobId);
+    if (!job) {
+      sendJson(res, 404, { ok: false, error: 'job_not_found' });
+      return;
+    }
+
+    const imageBuffer = getJobImageBuffer(job);
+    if (!imageBuffer) {
+      sendJson(res, 404, { ok: false, error: 'image_not_ready' });
+      return;
+    }
+
+    sendImage(res, imageBuffer, {
+      'Content-Type': job.mimeType || 'image/png',
+      'Content-Disposition': `inline; filename="${job.id}.png"`
+    });
+  } catch (error) {
+    sendJson(res, 500, {
+      ok: false,
+      error: String(error)
+    });
+  }
+}
+
 async function handleCancelGenerateJob(req, res, jobId) {
   try {
     const job = await cancelGenerateJob(jobId);
@@ -1235,6 +1269,7 @@ function handleGetProviders(req, res) {
 
 const server = http.createServer(async (req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const generateJobImageMatch = parsedUrl.pathname.match(/^\/api\/generate\/jobs\/([^/]+)\/image$/);
   const generateJobMatch = parsedUrl.pathname.match(/^\/api\/generate\/jobs\/([^/]+)$/);
 
   if (req.method === 'GET' && parsedUrl.pathname === '/health') {
@@ -1244,6 +1279,12 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && parsedUrl.pathname === '/api/generate/jobs') {
     await handleCreateGenerateJob(req, res);
+    return;
+  }
+
+  if (generateJobImageMatch && req.method === 'GET') {
+    const jobId = decodeURIComponent(generateJobImageMatch[1]);
+    await handleGetGenerateJobImage(req, res, jobId);
     return;
   }
 
