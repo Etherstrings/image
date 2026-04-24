@@ -3,7 +3,14 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { URL } = require('url');
-const { FREE_QUOTA, KEYS_SET, fingerprint, getQuotaStore } = require('./quota-store');
+const {
+  FREE_QUOTA,
+  KEYS_SET,
+  buildUserJobsKey,
+  buildUserKey,
+  fingerprint,
+  getQuotaStore
+} = require('./quota-store');
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -14,6 +21,10 @@ const MODEL_CAPACITY_ERROR = '当前模型资源有点紧张，请稍后再试�
 const DEFAULT_JOB_TTL_SECONDS = Number.parseInt(process.env.JOB_TTL_SECONDS || '3600', 10);
 const JOB_TTL_SECONDS = Number.isFinite(DEFAULT_JOB_TTL_SECONDS) && DEFAULT_JOB_TTL_SECONDS > 0 ? DEFAULT_JOB_TTL_SECONDS : 3600;
 const JOB_KEY_PREFIX = process.env.JOB_KEY_PREFIX || 'image_job:';
+const DEFAULT_JOB_HISTORY_LIMIT = Number.parseInt(process.env.JOB_HISTORY_LIMIT || '20', 10);
+const JOB_HISTORY_LIMIT = Number.isFinite(DEFAULT_JOB_HISTORY_LIMIT) && DEFAULT_JOB_HISTORY_LIMIT > 0 ? DEFAULT_JOB_HISTORY_LIMIT : 20;
+const DEFAULT_ACCOUNT_CREDIT = Number.parseInt(process.env.ACCOUNT_CREDIT_PER_KEY || '1', 10);
+const ACCOUNT_CREDIT_PER_KEY = Number.isFinite(DEFAULT_ACCOUNT_CREDIT) && DEFAULT_ACCOUNT_CREDIT > 0 ? DEFAULT_ACCOUNT_CREDIT : 1;
 
 const activeJobControllers = new Map();
 const memoryJobs = new Map();
@@ -228,8 +239,156 @@ function createJobId() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+function createUserId() {
+  if (typeof crypto.randomUUID === 'function') {
+    return `u_${crypto.randomUUID()}`;
+  }
+
+  return `u_${crypto.randomBytes(16).toString('hex')}`;
+}
+
 function buildJobStorageKey(jobId) {
   return `${JOB_KEY_PREFIX}${jobId}`;
+}
+
+function normalizeUserId(value) {
+  const userId = String(value || '').trim();
+  return /^u_[a-z0-9-]{8,}$/i.test(userId) ? userId : '';
+}
+
+function normalizeProfileName(value) {
+  return String(value || '').trim().slice(0, 40);
+}
+
+function buildGuestUsageKey(userId, guestKey) {
+  if (userId) {
+    return `free_user:${userId}`;
+  }
+
+  return guestKey;
+}
+
+async function migrateGuestUsageToUser(store, guestKey, userId) {
+  if (!store || !guestKey || !userId) {
+    return 0;
+  }
+
+  const guestUsageKey = buildGuestUsageKey('', guestKey);
+  const userUsageKey = buildGuestUsageKey(userId, guestKey);
+  const guestUsed = Number((await store.get(guestUsageKey)) || 0);
+  const userUsed = Number((await store.get(userUsageKey)) || 0);
+  const mergedUsed = Math.max(guestUsed, userUsed);
+
+  if (mergedUsed > 0) {
+    await store.set(userUsageKey, String(mergedUsed), JOB_TTL_SECONDS * 24);
+  }
+
+  return mergedUsed;
+}
+
+async function saveUser(store, user) {
+  if (!store) {
+    return user;
+  }
+
+  await store.set(buildUserKey(user.id), JSON.stringify(user), JOB_TTL_SECONDS * 24);
+  return user;
+}
+
+async function readUser(store, userId) {
+  if (!store || !userId) {
+    return null;
+  }
+
+  const raw = await store.get(buildUserKey(userId));
+  if (!raw) {
+    return null;
+  }
+
+  if (typeof raw === 'string') {
+    return JSON.parse(raw);
+  }
+
+  return raw;
+}
+
+async function ensureUser(store, userId) {
+  const normalized = normalizeUserId(userId);
+  if (normalized) {
+    const existing = await readUser(store, normalized);
+    if (existing) {
+      return existing;
+    }
+  }
+
+  const now = Date.now();
+  const nextUser = {
+    id: normalized || createUserId(),
+    role: 'guest',
+    credits: 0,
+    createdAt: now,
+    updatedAt: now,
+    profileName: null,
+  };
+
+  await saveUser(store, nextUser);
+  return nextUser;
+}
+
+async function updateUser(store, userId, updater) {
+  const current = await readUser(store, userId);
+  if (!current) {
+    return null;
+  }
+
+  const next = typeof updater === 'function' ? updater(current) : { ...current, ...updater };
+  if (!next) {
+    return null;
+  }
+
+  next.updatedAt = Date.now();
+  await saveUser(store, next);
+  return next;
+}
+
+async function appendUserJob(store, userId, jobId) {
+  if (!store || !userId || !jobId || typeof store.lpush !== 'function') {
+    return;
+  }
+
+  const key = buildUserJobsKey(userId);
+  await store.lpush(key, jobId);
+  if (typeof store.ltrim === 'function') {
+    await store.ltrim(key, 0, JOB_HISTORY_LIMIT - 1);
+  }
+}
+
+async function listUserJobs(store, userId, limit = JOB_HISTORY_LIMIT) {
+  if (!store || !userId || typeof store.lrange !== 'function') {
+    return [];
+  }
+
+  const key = buildUserJobsKey(userId);
+  const jobIds = await store.lrange(key, 0, Math.max(0, limit - 1));
+  return Array.isArray(jobIds) ? jobIds : [];
+}
+
+async function resolveAccessContext(req) {
+  const store = await getQuotaStore();
+  const guestKey = fingerprint(req);
+  const userId = normalizeUserId(req.headers['x-user-id']);
+  let user = null;
+
+  if (userId) {
+    user = await readUser(store, userId);
+  }
+
+  return {
+    store,
+    guestKey,
+    user,
+    userId: user ? user.id : '',
+  };
 }
 
 function isTerminalJobStatus(status) {
@@ -486,9 +645,22 @@ function buildResponseEndpoints(provider) {
 }
 
 async function tryProvider(provider, prompt, requestConfig, options = {}) {
+  const inputImage = typeof options.inputImage === 'string' && options.inputImage.startsWith('data:image/')
+    ? options.inputImage
+    : null;
   const payload = {
     model: requestConfig.model || 'gpt-5.4',
-    input: prompt,
+    input: inputImage
+      ? [
+          {
+            role: 'user',
+            content: [
+              { type: 'input_text', text: prompt },
+              { type: 'input_image', image_url: inputImage }
+            ]
+          }
+        ]
+      : prompt,
     tools: [
       {
         type: 'image_generation',
@@ -714,7 +886,10 @@ async function generateImageWithFallback(prompt, options = {}) {
           };
         }
 
-        const result = await tryProvider(provider, prompt, config.request, { signal: requestSignal });
+        const result = await tryProvider(provider, prompt, config.request, {
+          inputImage: options.inputImage || null,
+          signal: requestSignal
+        });
         attempts.push({
           provider: result.provider,
           endpoint: result.endpoint,
@@ -838,12 +1013,15 @@ async function handleGenerate(req, res) {
   }
 }
 
-async function createGenerateJob(prompt, preferredProviders) {
+async function createGenerateJob(prompt, preferredProviders, options = {}) {
   const now = Date.now();
   const job = {
     id: createJobId(),
     prompt,
     preferredProviders,
+    userId: options.userId || null,
+    inputImage: options.inputImage || null,
+    mode: options.inputImage ? 'image' : 'text',
     status: 'queued',
     createdAt: now,
     updatedAt: now,
@@ -851,6 +1029,11 @@ async function createGenerateJob(prompt, preferredProviders) {
   };
 
   await persistJob(job);
+
+   if (options.userId) {
+    await appendUserJob(options.store, options.userId, job.id);
+  }
+
   return job;
 }
 
@@ -917,6 +1100,7 @@ async function runGenerateJob(jobId) {
 
     const result = await generateImageWithFallback(job.prompt, {
       preferredProviders: job.preferredProviders,
+      inputImage: job.inputImage || null,
       signal: controller.signal
     });
 
@@ -1022,15 +1206,26 @@ async function handleCreateGenerateJob(req, res) {
   try {
     const raw = await readRequestBody(req);
     const body = parseJsonBody(raw);
+    const context = await resolveAccessContext(req);
     const prompt = String(body.prompt || '').trim();
     const preferredProviders = normalizeProviderNames(body.preferredProviders);
+    const inputImage = typeof body.image === 'string' && body.image.startsWith('data:image/') ? body.image : null;
 
     if (!prompt) {
       sendJson(res, 400, { ok: false, error: 'prompt is required' });
       return;
     }
 
-    const job = await createGenerateJob(prompt, preferredProviders);
+    if (inputImage && !context.user) {
+      sendJson(res, 403, { ok: false, error: '图生图需要先创建账号', errorCode: 'account_required_for_image' });
+      return;
+    }
+
+    const job = await createGenerateJob(prompt, preferredProviders, {
+      inputImage,
+      userId: context.userId,
+      store: context.store,
+    });
     runGenerateJob(job.id).catch((error) => {
       console.error('[generate-job] unhandled failure', job.id, error);
     });
@@ -1057,6 +1252,12 @@ async function handleGetGenerateJob(req, res, jobId) {
       return;
     }
 
+    const context = await resolveAccessContext(req);
+    if (job.userId && job.userId !== context.userId) {
+      sendJson(res, 403, { ok: false, error: 'forbidden' });
+      return;
+    }
+
     sendJson(res, 200, buildJobResponse(job));
   } catch (error) {
     sendJson(res, 500, {
@@ -1071,6 +1272,12 @@ async function handleGetGenerateJobImage(req, res, jobId) {
     const job = await readJob(jobId);
     if (!job) {
       sendJson(res, 404, { ok: false, error: 'job_not_found' });
+      return;
+    }
+
+    const context = await resolveAccessContext(req);
+    if (job.userId && job.userId !== context.userId) {
+      sendJson(res, 403, { ok: false, error: 'forbidden' });
       return;
     }
 
@@ -1094,6 +1301,13 @@ async function handleGetGenerateJobImage(req, res, jobId) {
 
 async function handleCancelGenerateJob(req, res, jobId) {
   try {
+    const context = await resolveAccessContext(req);
+    const current = await readJob(jobId);
+    if (current && current.userId && current.userId !== context.userId) {
+      sendJson(res, 403, { ok: false, error: 'forbidden' });
+      return;
+    }
+
     const job = await cancelGenerateJob(jobId);
     if (!job) {
       sendJson(res, 404, { ok: false, error: 'job_not_found' });
@@ -1109,13 +1323,91 @@ async function handleCancelGenerateJob(req, res, jobId) {
   }
 }
 
+async function handleSession(req, res) {
+  try {
+    const raw = await readRequestBody(req);
+    const body = parseJsonBody(raw);
+    const store = await getQuotaStore();
+    const user = await ensureUser(store, body.userId);
+    sendJson(res, 200, {
+      ok: true,
+      user: {
+        id: user.id,
+        role: user.role,
+        credits: user.credits || 0,
+        profileName: user.profileName || null,
+      }
+    });
+  } catch (error) {
+    sendJson(res, 500, { ok: false, error: String(error) });
+  }
+}
+
+async function handleRegister(req, res) {
+  try {
+    const raw = await readRequestBody(req);
+    const body = parseJsonBody(raw);
+    const store = await getQuotaStore();
+    const user = await ensureUser(store, body.userId);
+    const profileName = normalizeProfileName(body.profileName || body.name || '');
+
+    if (!profileName) {
+      sendJson(res, 400, { ok: false, error: '请输入账号名称' });
+      return;
+    }
+
+    const nextUser = await updateUser(store, user.id, (current) => ({
+      ...current,
+      role: 'account',
+      profileName,
+    }));
+
+    await migrateGuestUsageToUser(store, fingerprint(req), nextUser.id);
+
+    sendJson(res, 200, {
+      ok: true,
+      user: {
+        id: nextUser.id,
+        role: nextUser.role,
+        credits: nextUser.credits || 0,
+        profileName: nextUser.profileName || null,
+      }
+    });
+  } catch (error) {
+    sendJson(res, 500, { ok: false, error: String(error) });
+  }
+}
+
+async function handleUserJobs(req, res, userId) {
+  try {
+    const context = await resolveAccessContext(req);
+    if (!context.user || context.user.id !== userId) {
+      sendJson(res, 403, { ok: false, error: 'forbidden' });
+      return;
+    }
+
+    const jobIds = await listUserJobs(context.store, userId);
+    const jobs = [];
+    for (const jobId of jobIds) {
+      const job = await readJob(jobId);
+      if (!job) continue;
+      jobs.push(buildJobResponse(job));
+    }
+
+    sendJson(res, 200, { ok: true, jobs });
+  } catch (error) {
+    sendJson(res, 500, { ok: false, error: String(error) });
+  }
+}
+
 async function handleKeys(req, res) {
   try {
     const raw = await readRequestBody(req);
     const body = parseJsonBody(raw);
     const action = String(body.action || '').trim();
     const key = String(body.key || '').trim();
-    const store = await getQuotaStore();
+    const context = await resolveAccessContext(req);
+    const store = context.store;
 
     if (!store) {
       if (action === 'check_free') {
@@ -1133,13 +1425,13 @@ async function handleKeys(req, res) {
     }
 
     if (action === 'check_free') {
-      const used = Number((await store.get(fingerprint(req))) || 0);
+      const used = Number((await store.get(buildGuestUsageKey(context.userId, context.guestKey))) || 0);
       sendJson(res, 200, { free: used < FREE_QUOTA });
       return;
     }
 
     if (action === 'consume_free') {
-      const freeKey = fingerprint(req);
+      const freeKey = buildGuestUsageKey(context.userId, context.guestKey);
       const used = Number((await store.get(freeKey)) || 0);
 
       if (used >= FREE_QUOTA) {
@@ -1149,6 +1441,21 @@ async function handleKeys(req, res) {
 
       await store.incr(freeKey);
       sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (action === 'status') {
+      sendJson(res, 200, {
+        freeQuota: FREE_QUOTA,
+        user: context.user
+          ? {
+              id: context.user.id,
+              role: context.user.role,
+              credits: context.user.credits || 0,
+              profileName: context.user.profileName || null,
+            }
+          : null,
+      });
       return;
     }
 
@@ -1164,6 +1471,11 @@ async function handleKeys(req, res) {
     }
 
     if (action === 'consume') {
+      if (!context.user) {
+        sendJson(res, 403, { error: '请先创建账号再使用密钥' });
+        return;
+      }
+
       if (!key) {
         sendJson(res, 400, { error: '请输入密钥' });
         return;
@@ -1175,7 +1487,38 @@ async function handleKeys(req, res) {
         return;
       }
 
-      sendJson(res, 200, { ok: true });
+      await updateUser(store, context.user.id, (current) => ({
+        ...current,
+        credits: Number(current.credits || 0) + ACCOUNT_CREDIT_PER_KEY,
+      }));
+
+      sendJson(res, 200, { ok: true, creditsAdded: ACCOUNT_CREDIT_PER_KEY });
+      return;
+    }
+
+    if (action === 'consume_credit') {
+      if (!context.user) {
+        sendJson(res, 403, { error: '请先创建账号' });
+        return;
+      }
+
+      const current = await readUser(store, context.user.id);
+      const credits = Number(current?.credits || 0);
+
+      if (credits <= 0) {
+        sendJson(res, 403, { error: 'credits_exhausted', errorCode: 'credits_exhausted' });
+        return;
+      }
+
+      const nextUser = await updateUser(store, context.user.id, (user) => ({
+        ...user,
+        credits: Math.max(0, Number(user.credits || 0) - 1),
+      }));
+
+      sendJson(res, 200, {
+        ok: true,
+        credits: Number(nextUser.credits || 0),
+      });
       return;
     }
 
@@ -1271,6 +1614,7 @@ const server = http.createServer(async (req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const generateJobImageMatch = parsedUrl.pathname.match(/^\/api\/generate\/jobs\/([^/]+)\/image$/);
   const generateJobMatch = parsedUrl.pathname.match(/^\/api\/generate\/jobs\/([^/]+)$/);
+  const userJobsMatch = parsedUrl.pathname.match(/^\/api\/session\/([^/]+)\/jobs$/);
 
   if (req.method === 'GET' && parsedUrl.pathname === '/health') {
     sendJson(res, 200, { ok: true });
@@ -1279,6 +1623,21 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && parsedUrl.pathname === '/api/generate/jobs') {
     await handleCreateGenerateJob(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/session') {
+    await handleSession(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/session/register') {
+    await handleRegister(req, res);
+    return;
+  }
+
+  if (userJobsMatch && req.method === 'GET') {
+    await handleUserJobs(req, res, decodeURIComponent(userJobsMatch[1]));
     return;
   }
 
@@ -1330,6 +1689,20 @@ const server = http.createServer(async (req, res) => {
   sendText(res, 404, 'Not Found');
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`image-relay-backend listening on http://${HOST}:${PORT}`);
-});
+if (require.main === module) {
+  server.listen(PORT, HOST, () => {
+    console.log(`image-relay-backend listening on http://${HOST}:${PORT}`);
+  });
+}
+
+module.exports = {
+  server,
+  __test__: {
+    buildGuestUsageKey,
+    ensureUser,
+    readUser,
+    updateUser,
+    migrateGuestUsageToUser,
+    normalizeUserId,
+  },
+};

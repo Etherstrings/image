@@ -5,6 +5,8 @@ const { Redis: UpstashRedis } = require('@upstash/redis');
 const KEYS_SET = process.env.KEYS_SET || 'image_keys';
 const DEFAULT_FREE_QUOTA = Number.parseInt(process.env.FREE_QUOTA || '2', 10);
 const FREE_QUOTA = Number.isFinite(DEFAULT_FREE_QUOTA) && DEFAULT_FREE_QUOTA >= 0 ? DEFAULT_FREE_QUOTA : 2;
+const USER_KEY_PREFIX = process.env.USER_KEY_PREFIX || 'image_user:';
+const USER_JOB_LIST_PREFIX = process.env.USER_JOB_LIST_PREFIX || 'image_user_jobs:';
 
 let standardStorePromise = null;
 let upstashStore = null;
@@ -91,6 +93,15 @@ async function getStandardStore() {
         async sadd(key, ...members) {
           return client.sAdd(key, members);
         },
+        async lpush(key, ...values) {
+          return client.lPush(key, values);
+        },
+        async lrange(key, start, stop) {
+          return client.lRange(key, start, stop);
+        },
+        async ltrim(key, start, stop) {
+          return client.lTrim(key, start, stop);
+        },
         async scard(key) {
           return client.sCard(key);
         },
@@ -140,6 +151,15 @@ function getUpstashStore() {
       sadd(key, ...members) {
         return client.sadd(key, ...members);
       },
+      lpush(key, ...values) {
+        return client.lpush(key, ...values);
+      },
+      lrange(key, start, stop) {
+        return client.lrange(key, start, stop);
+      },
+      ltrim(key, start, stop) {
+        return client.ltrim(key, start, stop);
+      },
       scard(key) {
         return client.scard(key);
       },
@@ -164,9 +184,21 @@ function fingerprint(req) {
   return 'free:' + crypto.createHash('sha256').update(`${ip}:${ua}`).digest('hex').slice(0, 16);
 }
 
+function buildUserKey(userId) {
+  return `${USER_KEY_PREFIX}${userId}`;
+}
+
+function buildUserJobsKey(userId) {
+  return `${USER_JOB_LIST_PREFIX}${userId}`;
+}
+
 module.exports = {
   FREE_QUOTA,
   KEYS_SET,
+  USER_KEY_PREFIX,
+  USER_JOB_LIST_PREFIX,
+  buildUserKey,
+  buildUserJobsKey,
   fingerprint,
   getQuotaStore,
 };
