@@ -75,7 +75,8 @@ function writeConfig(nextConfig) {
 
 function requireAdmin(req) {
   if (!ADMIN_KEY) return true;
-  return req.headers['x-admin-key'] === ADMIN_KEY;
+  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  return req.headers['x-admin-key'] === ADMIN_KEY || parsedUrl.searchParams.get('key') === ADMIN_KEY;
 }
 
 function readRequestBody(req) {
@@ -1400,6 +1401,73 @@ async function handleUserJobs(req, res, userId) {
   }
 }
 
+async function handleDashboardStats(req, res) {
+  try {
+    if (!requireAdmin(req)) {
+      sendJson(res, 401, { ok: false, error: 'unauthorized' });
+      return;
+    }
+
+    const store = await getQuotaStore();
+    if (!store || typeof store.keys !== 'function') {
+      sendJson(res, 200, { ok: true, totals: {}, recentJobs: [] });
+      return;
+    }
+
+    const [userKeys, jobKeys] = await Promise.all([
+      store.keys(`${buildUserKey('')}*`),
+      store.keys(`${JOB_KEY_PREFIX}*`),
+    ]);
+
+    const users = [];
+    for (const key of userKeys || []) {
+      const raw = await store.get(key);
+      if (!raw) continue;
+      users.push(typeof raw === 'string' ? JSON.parse(raw) : raw);
+    }
+
+    const jobs = [];
+    for (const key of jobKeys || []) {
+      const raw = await store.get(key);
+      const job = parseStoredJob(raw);
+      if (job) jobs.push(job);
+    }
+
+    jobs.sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0));
+    const now = Date.now();
+    const recent24hJobs = jobs.filter((job) => now - Number(job.createdAt || 0) <= 24 * 60 * 60 * 1000);
+
+    sendJson(res, 200, {
+      ok: true,
+      totals: {
+        users: users.length,
+        accounts: users.filter((user) => user.role === 'account').length,
+        guests: users.filter((user) => user.role !== 'account').length,
+        jobs: jobs.length,
+        recent24h: recent24hJobs.length,
+        succeeded: jobs.filter((job) => job.status === 'succeeded').length,
+        failed: jobs.filter((job) => job.status === 'failed').length,
+        running: jobs.filter((job) => job.status === 'running').length,
+        queued: jobs.filter((job) => job.status === 'queued').length,
+        canceled: jobs.filter((job) => job.status === 'canceled').length,
+      },
+      recentJobs: jobs.slice(0, 20).map((job) => ({
+        id: job.id,
+        prompt: String(job.prompt || '').slice(0, 80),
+        status: job.status,
+        mode: job.mode || 'text',
+        providerName: job.providerName || null,
+        error: job.error || null,
+        createdAt: job.createdAt,
+        completedAt: job.completedAt || null,
+        userId: job.userId || null,
+      })),
+    });
+  } catch (error) {
+    sendJson(res, 500, { ok: false, error: String(error) });
+  }
+}
+
 async function handleKeys(req, res) {
   try {
     const raw = await readRequestBody(req);
@@ -1638,6 +1706,11 @@ const server = http.createServer(async (req, res) => {
 
   if (userJobsMatch && req.method === 'GET') {
     await handleUserJobs(req, res, decodeURIComponent(userJobsMatch[1]));
+    return;
+  }
+
+  if (req.method === 'GET' && parsedUrl.pathname === '/internal/dashboard/stats') {
+    await handleDashboardStats(req, res);
     return;
   }
 

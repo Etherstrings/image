@@ -105,6 +105,9 @@ async function getStandardStore() {
         async scard(key) {
           return client.sCard(key);
         },
+        async keys(pattern) {
+          return client.keys(pattern);
+        },
       };
     })().catch((error) => {
       standardStorePromise = null;
@@ -162,6 +165,9 @@ function getUpstashStore() {
       },
       scard(key) {
         return client.scard(key);
+      },
+      keys(pattern) {
+        return client.keys(pattern);
       },
     };
   }
