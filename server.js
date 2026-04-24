@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
@@ -10,6 +11,12 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const CONFIG_PATH = process.env.PROVIDERS_CONFIG_PATH || path.join(__dirname, 'providers.json');
 const DEFAULT_PREFERRED_PROVIDER_NAMES = ['1024token', 'custom'];
 const MODEL_CAPACITY_ERROR = '当前模型资源有点紧张，请稍后再试一次。';
+const DEFAULT_JOB_TTL_SECONDS = Number.parseInt(process.env.JOB_TTL_SECONDS || '3600', 10);
+const JOB_TTL_SECONDS = Number.isFinite(DEFAULT_JOB_TTL_SECONDS) && DEFAULT_JOB_TTL_SECONDS > 0 ? DEFAULT_JOB_TTL_SECONDS : 3600;
+const JOB_KEY_PREFIX = process.env.JOB_KEY_PREFIX || 'image_job:';
+
+const activeJobControllers = new Map();
+const memoryJobs = new Map();
 
 function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload, null, 2);
@@ -180,6 +187,15 @@ function isRetryableAttemptFailure(result) {
 }
 
 function buildGenerationFailure(result) {
+  if (result.canceled) {
+    return {
+      statusCode: 499,
+      error: '生成任务已取消',
+      errorCode: 'canceled',
+      retryable: true
+    };
+  }
+
   if (result.error === 'All providers failed') {
     return {
       statusCode: 503,
@@ -197,6 +213,147 @@ function buildGenerationFailure(result) {
       retryable: false
     };
   }
+}
+
+function isAbortError(error) {
+  if (!error) return false;
+  if (error.name === 'AbortError') return true;
+  return String(error.message || error).toLowerCase().includes('abort');
+}
+
+function createJobId() {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function buildJobStorageKey(jobId) {
+  return `${JOB_KEY_PREFIX}${jobId}`;
+}
+
+function isTerminalJobStatus(status) {
+  return status === 'succeeded' || status === 'failed' || status === 'canceled';
+}
+
+function parseStoredJob(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'string') {
+    return JSON.parse(raw);
+  }
+  return raw;
+}
+
+function readMemoryJob(jobId) {
+  const key = buildJobStorageKey(jobId);
+  const cached = memoryJobs.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    memoryJobs.delete(key);
+    return null;
+  }
+  return parseStoredJob(cached.raw);
+}
+
+async function persistJob(job) {
+  const key = buildJobStorageKey(job.id);
+  const raw = JSON.stringify(job);
+  const store = await getQuotaStore();
+
+  if (store && typeof store.set === 'function') {
+    await store.set(key, raw, JOB_TTL_SECONDS);
+    return job;
+  }
+
+  memoryJobs.set(key, {
+    raw,
+    expiresAt: Date.now() + JOB_TTL_SECONDS * 1000
+  });
+  return job;
+}
+
+async function readJob(jobId) {
+  const key = buildJobStorageKey(jobId);
+  const store = await getQuotaStore();
+
+  if (store && typeof store.get === 'function') {
+    const raw = await store.get(key);
+    return parseStoredJob(raw);
+  }
+
+  return readMemoryJob(jobId);
+}
+
+async function updateJob(jobId, updater) {
+  const current = await readJob(jobId);
+  if (!current) return null;
+
+  const next = typeof updater === 'function' ? updater(current) : { ...current, ...updater };
+  if (!next) return null;
+
+  next.updatedAt = Date.now();
+  await persistJob(next);
+  return next;
+}
+
+function summarizeAttempts(attempts = []) {
+  return attempts.map((attempt) => ({
+    provider: attempt.provider,
+    status: attempt.status,
+    round: attempt.round,
+    retry: attempt.retry,
+    retryable: attempt.retryable !== false,
+    error: summarizeAttemptError(attempt.error)
+  }));
+}
+
+function buildJobResponse(job) {
+  const response = {
+    ok: true,
+    jobId: job.id,
+    status: job.status,
+    prompt: job.prompt,
+    providerName: job.providerName || null,
+    error: job.error || null,
+    errorCode: job.errorCode || null,
+    retryable: job.retryable === true,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    completedAt: job.completedAt || null
+  };
+
+  if (job.status === 'succeeded' && job.imageBase64) {
+    response.imageUrl = `data:${job.mimeType || 'image/png'};base64,${job.imageBase64}`;
+  }
+
+  return response;
+}
+
+function createClientAbortSignal(req, res) {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort();
+    }
+  };
+  const onClose = () => {
+    if (!res.writableEnded) {
+      abort();
+    }
+  };
+
+  req.on('aborted', abort);
+  req.on('error', abort);
+  res.on('close', onClose);
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      req.off('aborted', abort);
+      req.off('error', abort);
+      res.off('close', onClose);
+    }
+  };
 }
 
 async function readSseResult(response) {
@@ -320,7 +477,7 @@ function buildResponseEndpoints(provider) {
   return uniqueStrings(candidates);
 }
 
-async function tryProvider(provider, prompt, requestConfig) {
+async function tryProvider(provider, prompt, requestConfig, options = {}) {
   const payload = {
     model: requestConfig.model || 'gpt-5.4',
     input: prompt,
@@ -339,8 +496,35 @@ async function tryProvider(provider, prompt, requestConfig) {
 
   const endpoints = buildResponseEndpoints(provider);
   let lastFailure = null;
+  const requestSignal = options.signal;
+
+  if (requestSignal?.aborted) {
+    return {
+      ok: false,
+      provider: provider.name,
+      endpoint: endpoints[0] || '',
+      status: null,
+      contentType: null,
+      error: 'Request aborted',
+      retryable: false,
+      canceled: true
+    };
+  }
 
   for (const endpoint of endpoints) {
+    if (requestSignal?.aborted) {
+      return {
+        ok: false,
+        provider: provider.name,
+        endpoint,
+        status: null,
+        contentType: null,
+        error: 'Request aborted',
+        retryable: false,
+        canceled: true
+      };
+    }
+
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -349,7 +533,8 @@ async function tryProvider(provider, prompt, requestConfig) {
           'Content-Type': 'application/json',
           Accept: 'text/event-stream'
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: requestSignal
       });
 
       const contentType = response.headers.get('content-type') || '';
@@ -428,6 +613,19 @@ async function tryProvider(provider, prompt, requestConfig) {
         }
       };
     } catch (error) {
+      if (requestSignal?.aborted || isAbortError(error)) {
+        return {
+          ok: false,
+          provider: provider.name,
+          endpoint,
+          status: null,
+          contentType: null,
+          error: 'Request aborted',
+          retryable: false,
+          canceled: true
+        };
+      }
+
       lastFailure = {
         ok: false,
         provider: provider.name,
@@ -455,6 +653,7 @@ async function tryProvider(provider, prompt, requestConfig) {
 async function generateImageWithFallback(prompt, options = {}) {
   const config = readConfig();
   const enabledProviders = config.providers.filter((provider) => provider.enabled !== false);
+  const requestSignal = options.signal;
   if (enabledProviders.length === 0) {
     return {
       ok: false,
@@ -479,6 +678,16 @@ async function generateImageWithFallback(prompt, options = {}) {
   const exhaustedProviders = new Set();
 
   for (let round = 0; round < retryRounds; round += 1) {
+    if (requestSignal?.aborted) {
+      return {
+        ok: false,
+        statusCode: 499,
+        error: 'Generation canceled',
+        attempts,
+        canceled: true
+      };
+    }
+
     for (let providerIndex = 0; providerIndex < orderedProviders.length; providerIndex += 1) {
       const provider = orderedProviders[providerIndex];
       const providerKey = getProviderKey(provider);
@@ -487,7 +696,17 @@ async function generateImageWithFallback(prompt, options = {}) {
       }
 
       for (let retry = 0; retry < retriesPerProvider; retry += 1) {
-        const result = await tryProvider(provider, prompt, config.request);
+        if (requestSignal?.aborted) {
+          return {
+            ok: false,
+            statusCode: 499,
+            error: 'Generation canceled',
+            attempts,
+            canceled: true
+          };
+        }
+
+        const result = await tryProvider(provider, prompt, config.request, { signal: requestSignal });
         attempts.push({
           provider: result.provider,
           endpoint: result.endpoint,
@@ -499,6 +718,16 @@ async function generateImageWithFallback(prompt, options = {}) {
           meta: result.meta || null,
           error: result.error || result.body || result.sse || null
         });
+
+        if (result.canceled) {
+          return {
+            ok: false,
+            statusCode: 499,
+            error: 'Generation canceled',
+            attempts,
+            canceled: true
+          };
+        }
 
         if (result.ok) {
           const providerPosition = enabledProviders.findIndex((item) => item.name === provider.name && item.url === provider.url);
@@ -536,6 +765,8 @@ async function generateImageWithFallback(prompt, options = {}) {
 }
 
 async function handleGenerate(req, res) {
+  const requestAbort = createClientAbortSignal(req, res);
+
   try {
     const raw = await readRequestBody(req);
     const body = parseJsonBody(raw);
@@ -547,7 +778,15 @@ async function handleGenerate(req, res) {
       return;
     }
 
-    const result = await generateImageWithFallback(prompt, { preferredProviders });
+    const result = await generateImageWithFallback(prompt, {
+      preferredProviders,
+      signal: requestAbort.signal
+    });
+
+    if (requestAbort.signal.aborted || res.writableEnded || res.destroyed || result.canceled) {
+      return;
+    }
+
     if (!result.ok) {
       const failure = buildGenerationFailure(result);
       console.error('[generate] request failed', JSON.stringify({
@@ -577,6 +816,257 @@ async function handleGenerate(req, res) {
       'X-Image-Quality': (result.meta.finalCall && result.meta.finalCall.quality) || '',
       'X-Image-Size': (result.meta.finalCall && result.meta.finalCall.size) || ''
     });
+  } catch (error) {
+    if (requestAbort.signal.aborted || res.writableEnded || res.destroyed) {
+      return;
+    }
+
+    sendJson(res, 500, {
+      ok: false,
+      error: String(error)
+    });
+  } finally {
+    requestAbort.cleanup();
+  }
+}
+
+async function createGenerateJob(prompt, preferredProviders) {
+  const now = Date.now();
+  const job = {
+    id: createJobId(),
+    prompt,
+    preferredProviders,
+    status: 'queued',
+    createdAt: now,
+    updatedAt: now,
+    retryable: false
+  };
+
+  await persistJob(job);
+  return job;
+}
+
+async function cancelGenerateJob(jobId, reason = '生成任务已取消') {
+  const job = await readJob(jobId);
+  if (!job) {
+    return null;
+  }
+
+  if (isTerminalJobStatus(job.status)) {
+    return job;
+  }
+
+  const controller = activeJobControllers.get(jobId);
+  if (controller && !controller.signal.aborted) {
+    controller.abort();
+  }
+
+  return updateJob(jobId, (current) => {
+    if (!current || isTerminalJobStatus(current.status)) {
+      return current;
+    }
+
+    return {
+      ...current,
+      status: 'canceled',
+      error: reason,
+      errorCode: 'canceled',
+      retryable: true,
+      completedAt: Date.now()
+    };
+  });
+}
+
+async function runGenerateJob(jobId) {
+  const currentJob = await readJob(jobId);
+  if (!currentJob || isTerminalJobStatus(currentJob.status)) {
+    return currentJob;
+  }
+
+  const controller = new AbortController();
+  activeJobControllers.set(jobId, controller);
+
+  await updateJob(jobId, (current) => {
+    if (!current || isTerminalJobStatus(current.status)) {
+      return current;
+    }
+
+    return {
+      ...current,
+      status: 'running',
+      startedAt: current.startedAt || Date.now(),
+      error: null,
+      errorCode: null,
+      retryable: false
+    };
+  });
+
+  try {
+    const job = await readJob(jobId);
+    if (!job || job.status === 'canceled') {
+      return job;
+    }
+
+    const result = await generateImageWithFallback(job.prompt, {
+      preferredProviders: job.preferredProviders,
+      signal: controller.signal
+    });
+
+    if (controller.signal.aborted || result.canceled) {
+      return updateJob(jobId, (current) => {
+        if (!current || isTerminalJobStatus(current.status)) {
+          return current;
+        }
+
+        return {
+          ...current,
+          status: 'canceled',
+          error: '生成任务已取消',
+          errorCode: 'canceled',
+          retryable: true,
+          completedAt: Date.now()
+        };
+      });
+    }
+
+    if (!result.ok) {
+      const failure = buildGenerationFailure(result);
+      console.error('[generate-job] request failed', JSON.stringify({
+        jobId,
+        error: result.error,
+        attempts: summarizeAttempts(result.attempts)
+      }));
+
+      return updateJob(jobId, (current) => {
+        if (!current || isTerminalJobStatus(current.status)) {
+          return current;
+        }
+
+        return {
+          ...current,
+          status: 'failed',
+          error: failure.error,
+          errorCode: failure.errorCode,
+          retryable: failure.retryable,
+          attempts: summarizeAttempts(result.attempts),
+          completedAt: Date.now()
+        };
+      });
+    }
+
+    return updateJob(jobId, (current) => {
+      if (!current || isTerminalJobStatus(current.status)) {
+        return current;
+      }
+
+      return {
+        ...current,
+        status: 'succeeded',
+        providerName: result.provider,
+        mimeType: 'image/png',
+        imageBase64: result.buffer.toString('base64'),
+        attempts: summarizeAttempts(result.attempts),
+        retryable: false,
+        completedAt: Date.now(),
+        error: null,
+        errorCode: null
+      };
+    });
+  } catch (error) {
+    if (controller.signal.aborted || isAbortError(error)) {
+      return updateJob(jobId, (current) => {
+        if (!current || isTerminalJobStatus(current.status)) {
+          return current;
+        }
+
+        return {
+          ...current,
+          status: 'canceled',
+          error: '生成任务已取消',
+          errorCode: 'canceled',
+          retryable: true,
+          completedAt: Date.now()
+        };
+      });
+    }
+
+    console.error('[generate-job] unexpected failure', jobId, error);
+    return updateJob(jobId, (current) => {
+      if (!current || isTerminalJobStatus(current.status)) {
+        return current;
+      }
+
+      return {
+        ...current,
+        status: 'failed',
+        error: '生成服务暂时不可用，请稍后再试',
+        errorCode: 'generate_failed',
+        retryable: true,
+        completedAt: Date.now()
+      };
+    });
+  } finally {
+    activeJobControllers.delete(jobId);
+  }
+}
+
+async function handleCreateGenerateJob(req, res) {
+  try {
+    const raw = await readRequestBody(req);
+    const body = parseJsonBody(raw);
+    const prompt = String(body.prompt || '').trim();
+    const preferredProviders = normalizeProviderNames(body.preferredProviders);
+
+    if (!prompt) {
+      sendJson(res, 400, { ok: false, error: 'prompt is required' });
+      return;
+    }
+
+    const job = await createGenerateJob(prompt, preferredProviders);
+    runGenerateJob(job.id).catch((error) => {
+      console.error('[generate-job] unhandled failure', job.id, error);
+    });
+
+    sendJson(res, 202, {
+      ok: true,
+      jobId: job.id,
+      status: job.status,
+      createdAt: job.createdAt
+    });
+  } catch (error) {
+    sendJson(res, 500, {
+      ok: false,
+      error: String(error)
+    });
+  }
+}
+
+async function handleGetGenerateJob(req, res, jobId) {
+  try {
+    const job = await readJob(jobId);
+    if (!job) {
+      sendJson(res, 404, { ok: false, error: 'job_not_found' });
+      return;
+    }
+
+    sendJson(res, 200, buildJobResponse(job));
+  } catch (error) {
+    sendJson(res, 500, {
+      ok: false,
+      error: String(error)
+    });
+  }
+}
+
+async function handleCancelGenerateJob(req, res, jobId) {
+  try {
+    const job = await cancelGenerateJob(jobId);
+    if (!job) {
+      sendJson(res, 404, { ok: false, error: 'job_not_found' });
+      return;
+    }
+
+    sendJson(res, 200, buildJobResponse(job));
   } catch (error) {
     sendJson(res, 500, {
       ok: false,
@@ -745,10 +1235,30 @@ function handleGetProviders(req, res) {
 
 const server = http.createServer(async (req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const generateJobMatch = parsedUrl.pathname.match(/^\/api\/generate\/jobs\/([^/]+)$/);
 
   if (req.method === 'GET' && parsedUrl.pathname === '/health') {
     sendJson(res, 200, { ok: true });
     return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/generate/jobs') {
+    await handleCreateGenerateJob(req, res);
+    return;
+  }
+
+  if (generateJobMatch) {
+    const jobId = decodeURIComponent(generateJobMatch[1]);
+
+    if (req.method === 'GET') {
+      await handleGetGenerateJob(req, res, jobId);
+      return;
+    }
+
+    if (req.method === 'DELETE') {
+      await handleCancelGenerateJob(req, res, jobId);
+      return;
+    }
   }
 
   if (req.method === 'POST' && parsedUrl.pathname === '/api/generate-image') {

@@ -70,6 +70,15 @@ async function getStandardStore() {
         async get(key) {
           return client.get(key);
         },
+        async set(key, value, ttlSeconds) {
+          if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+            return client.set(key, value, { EX: ttlSeconds });
+          }
+          return client.set(key, value);
+        },
+        async del(key) {
+          return client.del(key);
+        },
         async incr(key) {
           return client.incr(key);
         },
@@ -109,6 +118,15 @@ function getUpstashStore() {
       mode: 'upstash',
       get(key) {
         return client.get(key);
+      },
+      set(key, value, ttlSeconds) {
+        if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+          return client.set(key, value, { ex: ttlSeconds });
+        }
+        return client.set(key, value);
+      },
+      del(key) {
+        return client.del(key);
       },
       incr(key) {
         return client.incr(key);
