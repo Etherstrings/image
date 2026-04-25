@@ -768,7 +768,6 @@ async function tryProvider(provider, prompt, requestConfig, options = {}) {
       const imageBase64 = sse.finalCall && sse.finalCall.result;
 
       if (!imageBase64) {
-        const emptySuccessfulStream = !sse.error && !sse.outputText && (!sse.finalCall || !sse.finalCall.result);
         lastFailure = {
           ok: false,
           provider: provider.name,
@@ -790,7 +789,7 @@ async function tryProvider(provider, prompt, requestConfig, options = {}) {
             outputText: sse.outputText || '',
             error: sse.error
           },
-          retryable: emptySuccessfulStream || isRetryableAttemptFailure({ sse })
+          retryable: true
         };
         continue;
       }
@@ -872,7 +871,7 @@ async function generateImageWithFallback(prompt, options = {}) {
     preferredProviderNames
   );
   const attempts = [];
-  const retriesPerProvider = Math.max(2, readInteger(config.request.retriesPerProvider, 1));
+  const retriesPerProvider = Math.max(3, readInteger(config.request.retriesPerProvider, 1));
   const retryRounds = Math.max(1, readInteger(config.request.retryRounds, 1));
   const retryDelayMs = Math.max(0, readInteger(config.request.retryDelayMs, 0));
   const exhaustedProviders = new Set();
