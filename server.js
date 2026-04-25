@@ -536,6 +536,23 @@ async function readSseResult(response) {
     error: null
   };
 
+  function captureOutputItem(item) {
+    if (!item || typeof item !== 'object') return;
+
+    if (item.type === 'image_generation_call') {
+      result.finalCall = item;
+      return;
+    }
+
+    if (item.type === 'message' && Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (part.type === 'output_text' && part.text) {
+          result.outputText += part.text;
+        }
+      }
+    }
+  }
+
   function handleEvent(obj) {
     if (obj.response && obj.response.id) {
       result.responseId = obj.response.id;
@@ -556,15 +573,16 @@ async function readSseResult(response) {
     }
 
     if (obj.type === 'response.output_item.done' && obj.item) {
-      if (obj.item.type === 'image_generation_call') {
-        result.finalCall = obj.item;
-      }
-      if (obj.item.type === 'message' && Array.isArray(obj.item.content)) {
-        for (const part of obj.item.content) {
-          if (part.type === 'output_text' && part.text) {
-            result.outputText += part.text;
-          }
-        }
+      captureOutputItem(obj.item);
+    }
+
+    if (
+      (obj.type === 'response.completed' || obj.type === 'response.incomplete') &&
+      obj.response &&
+      Array.isArray(obj.response.output)
+    ) {
+      for (const item of obj.response.output) {
+        captureOutputItem(item);
       }
     }
 
@@ -750,6 +768,7 @@ async function tryProvider(provider, prompt, requestConfig, options = {}) {
       const imageBase64 = sse.finalCall && sse.finalCall.result;
 
       if (!imageBase64) {
+        const emptySuccessfulStream = !sse.error && !sse.outputText && (!sse.finalCall || !sse.finalCall.result);
         lastFailure = {
           ok: false,
           provider: provider.name,
@@ -771,7 +790,7 @@ async function tryProvider(provider, prompt, requestConfig, options = {}) {
             outputText: sse.outputText || '',
             error: sse.error
           },
-          retryable: isRetryableAttemptFailure({ sse })
+          retryable: emptySuccessfulStream || isRetryableAttemptFailure({ sse })
         };
         continue;
       }
@@ -853,7 +872,7 @@ async function generateImageWithFallback(prompt, options = {}) {
     preferredProviderNames
   );
   const attempts = [];
-  const retriesPerProvider = Math.max(1, readInteger(config.request.retriesPerProvider, 1));
+  const retriesPerProvider = Math.max(2, readInteger(config.request.retriesPerProvider, 1));
   const retryRounds = Math.max(1, readInteger(config.request.retryRounds, 1));
   const retryDelayMs = Math.max(0, readInteger(config.request.retryDelayMs, 0));
   const exhaustedProviders = new Set();
