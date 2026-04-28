@@ -3,8 +3,8 @@ const { createClient } = require('redis');
 const { Redis: UpstashRedis } = require('@upstash/redis');
 
 const KEYS_SET = process.env.KEYS_SET || 'image_keys';
-const DEFAULT_FREE_QUOTA = Number.parseInt(process.env.FREE_QUOTA || '2', 10);
-const FREE_QUOTA = Number.isFinite(DEFAULT_FREE_QUOTA) && DEFAULT_FREE_QUOTA >= 0 ? DEFAULT_FREE_QUOTA : 2;
+const DEFAULT_FREE_QUOTA = Number.parseInt(process.env.FREE_QUOTA || '10', 10);
+const FREE_QUOTA = Number.isFinite(DEFAULT_FREE_QUOTA) && DEFAULT_FREE_QUOTA >= 0 ? DEFAULT_FREE_QUOTA : 10;
 const USER_KEY_PREFIX = process.env.USER_KEY_PREFIX || 'image_user:';
 const USER_JOB_LIST_PREFIX = process.env.USER_JOB_LIST_PREFIX || 'image_user_jobs:';
 

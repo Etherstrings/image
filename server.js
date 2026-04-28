@@ -25,6 +25,7 @@ const DEFAULT_JOB_HISTORY_LIMIT = Number.parseInt(process.env.JOB_HISTORY_LIMIT 
 const JOB_HISTORY_LIMIT = Number.isFinite(DEFAULT_JOB_HISTORY_LIMIT) && DEFAULT_JOB_HISTORY_LIMIT > 0 ? DEFAULT_JOB_HISTORY_LIMIT : 20;
 const DEFAULT_ACCOUNT_CREDIT = Number.parseInt(process.env.ACCOUNT_CREDIT_PER_KEY || '1', 10);
 const ACCOUNT_CREDIT_PER_KEY = Number.isFinite(DEFAULT_ACCOUNT_CREDIT) && DEFAULT_ACCOUNT_CREDIT > 0 ? DEFAULT_ACCOUNT_CREDIT : 1;
+const FREE_QUOTA_CONFIG_KEY = process.env.FREE_QUOTA_CONFIG_KEY || 'image_config:free_quota';
 
 const activeJobControllers = new Map();
 const memoryJobs = new Map();
@@ -267,6 +268,51 @@ function buildGuestUsageKey(userId, guestKey) {
   }
 
   return guestKey;
+}
+
+async function getEffectiveFreeQuota(store) {
+  if (!store) {
+    return FREE_QUOTA;
+  }
+
+  const raw = await store.get(FREE_QUOTA_CONFIG_KEY);
+  const configured = Number.parseInt(String(raw || ''), 10);
+  return Number.isFinite(configured) && configured >= 0 ? configured : FREE_QUOTA;
+}
+
+async function setEffectiveFreeQuota(store, freeQuota) {
+  const nextQuota = Number.parseInt(String(freeQuota ?? ''), 10);
+  if (!Number.isFinite(nextQuota) || nextQuota < 0 || nextQuota > 100000) {
+    throw new Error('freeQuota must be an integer between 0 and 100000');
+  }
+
+  if (!store) {
+    return nextQuota;
+  }
+
+  await store.set(FREE_QUOTA_CONFIG_KEY, String(nextQuota));
+  return nextQuota;
+}
+
+async function listFreeUsageKeys(store) {
+  if (!store || typeof store.keys !== 'function') {
+    return [];
+  }
+
+  const [guestKeys, userKeys] = await Promise.all([
+    store.keys('free:*'),
+    store.keys('free_user:*'),
+  ]);
+
+  return uniqueStrings([...(guestKeys || []), ...(userKeys || [])]);
+}
+
+async function resetFreeUsage(store) {
+  const keys = await listFreeUsageKeys(store);
+  for (const key of keys) {
+    await store.del(key);
+  }
+  return keys.length;
 }
 
 async function migrateGuestUsageToUser(store, guestKey, userId) {
@@ -1436,6 +1482,10 @@ async function handleDashboardStats(req, res) {
       store.keys(`${buildUserKey('')}*`),
       store.keys(`${JOB_KEY_PREFIX}*`),
     ]);
+    const [freeQuota, freeUsageKeys] = await Promise.all([
+      getEffectiveFreeQuota(store),
+      listFreeUsageKeys(store),
+    ]);
 
     const users = [];
     for (const key of userKeys || []) {
@@ -1469,6 +1519,10 @@ async function handleDashboardStats(req, res) {
         queued: jobs.filter((job) => job.status === 'queued').length,
         canceled: jobs.filter((job) => job.status === 'canceled').length,
       },
+      quota: {
+        freeQuota,
+        freeUsageUsers: freeUsageKeys.length,
+      },
       recentJobs: jobs.slice(0, 20).map((job) => ({
         id: job.id,
         prompt: String(job.prompt || '').slice(0, 80),
@@ -1483,6 +1537,41 @@ async function handleDashboardStats(req, res) {
     });
   } catch (error) {
     sendJson(res, 500, { ok: false, error: String(error) });
+  }
+}
+
+async function handleDashboardAction(req, res) {
+  try {
+    if (!requireAdmin(req)) {
+      sendJson(res, 401, { ok: false, error: 'unauthorized' });
+      return;
+    }
+
+    const raw = await readRequestBody(req);
+    const body = parseJsonBody(raw);
+    const action = String(body.action || '').trim();
+    const store = await getQuotaStore();
+
+    if (!store) {
+      sendJson(res, 503, { ok: false, error: 'quota store unavailable' });
+      return;
+    }
+
+    if (action === 'set_free_quota') {
+      const freeQuota = await setEffectiveFreeQuota(store, body.freeQuota);
+      sendJson(res, 200, { ok: true, freeQuota });
+      return;
+    }
+
+    if (action === 'reset_free_usage') {
+      const deleted = await resetFreeUsage(store);
+      sendJson(res, 200, { ok: true, deleted });
+      return;
+    }
+
+    sendJson(res, 400, { ok: false, error: 'unknown action' });
+  } catch (error) {
+    sendJson(res, 500, { ok: false, error: String(error.message || error) });
   }
 }
 
@@ -1511,16 +1600,18 @@ async function handleKeys(req, res) {
     }
 
     if (action === 'check_free') {
+      const freeQuota = await getEffectiveFreeQuota(store);
       const used = Number((await store.get(buildGuestUsageKey(context.userId, context.guestKey))) || 0);
-      sendJson(res, 200, { free: used < FREE_QUOTA });
+      sendJson(res, 200, { free: used < freeQuota });
       return;
     }
 
     if (action === 'consume_free') {
+      const freeQuota = await getEffectiveFreeQuota(store);
       const freeKey = buildGuestUsageKey(context.userId, context.guestKey);
       const used = Number((await store.get(freeKey)) || 0);
 
-      if (used >= FREE_QUOTA) {
+      if (used >= freeQuota) {
         sendJson(res, 403, { error: 'free_exhausted' });
         return;
       }
@@ -1531,8 +1622,9 @@ async function handleKeys(req, res) {
     }
 
     if (action === 'status') {
+      const freeQuota = await getEffectiveFreeQuota(store);
       sendJson(res, 200, {
-        freeQuota: FREE_QUOTA,
+        freeQuota,
         user: context.user
           ? {
               id: context.user.id,
@@ -1729,6 +1821,11 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && parsedUrl.pathname === '/internal/dashboard/stats') {
     await handleDashboardStats(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/internal/dashboard/stats') {
+    await handleDashboardAction(req, res);
     return;
   }
 
