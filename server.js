@@ -16,7 +16,7 @@ const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const CONFIG_PATH = process.env.PROVIDERS_CONFIG_PATH || path.join(__dirname, 'providers.json');
-const DEFAULT_PREFERRED_PROVIDER_NAMES = ['1024token', 'custom'];
+const DEFAULT_PREFERRED_PROVIDER_NAMES = ['justice_token_base'];
 const MODEL_CAPACITY_ERROR = '当前模型资源有点紧张，请稍后再试一次。';
 const DEFAULT_JOB_TTL_SECONDS = Number.parseInt(process.env.JOB_TTL_SECONDS || '3600', 10);
 const JOB_TTL_SECONDS = Number.isFinite(DEFAULT_JOB_TTL_SECONDS) && DEFAULT_JOB_TTL_SECONDS > 0 ? DEFAULT_JOB_TTL_SECONDS : 3600;
@@ -26,9 +26,30 @@ const JOB_HISTORY_LIMIT = Number.isFinite(DEFAULT_JOB_HISTORY_LIMIT) && DEFAULT_
 const DEFAULT_ACCOUNT_CREDIT = Number.parseInt(process.env.ACCOUNT_CREDIT_PER_KEY || '1', 10);
 const ACCOUNT_CREDIT_PER_KEY = Number.isFinite(DEFAULT_ACCOUNT_CREDIT) && DEFAULT_ACCOUNT_CREDIT > 0 ? DEFAULT_ACCOUNT_CREDIT : 1;
 const FREE_QUOTA_CONFIG_KEY = process.env.FREE_QUOTA_CONFIG_KEY || 'image_config:free_quota';
+const SUB2API_BASE_URL = (process.env.SUB2API_BASE_URL || 'http://127.0.0.1:8080').replace(/\/+$/, '');
+const SUB2API_IMAGE_GROUP_ID = Number.parseInt(process.env.SUB2API_IMAGE_GROUP_ID || '', 10);
+const SUB2API_IMAGE_GROUP_NAME = process.env.SUB2API_IMAGE_GROUP_NAME || '生图专用分组';
+const SUB2API_IMAGE_API_KEY_NAME = process.env.SUB2API_IMAGE_API_KEY_NAME || '生图专用';
+const SUB2API_IMAGE_MODEL = process.env.SUB2API_IMAGE_MODEL || 'gpt-image-2';
+const SUB2API_IMAGE_SIZE = process.env.SUB2API_IMAGE_SIZE || '1024x1536';
+const FREE_TEXT_CLICKS = readPositiveInt(process.env.IMAGE_FREE_TEXT_CLICKS, 2);
+const FREE_IMAGE_CLICKS = readPositiveInt(process.env.IMAGE_FREE_IMAGE_CLICKS, 2);
+const IMAGES_PER_CLICK = readPositiveInt(process.env.IMAGE_IMAGES_PER_CLICK, 2);
+const GENERATION_GRANT_TTL_SECONDS = readPositiveInt(process.env.GENERATION_GRANT_TTL_SECONDS, 600);
+const FREE_USAGE_PREFIX = process.env.FREE_USAGE_PREFIX || 'sub2api_image_free:';
+const GENERATION_GRANT_PREFIX = process.env.GENERATION_GRANT_PREFIX || 'sub2api_image_grant:';
+const IMAGE_API_KEY_PREFIX = process.env.IMAGE_API_KEY_PREFIX || 'sub2api_image_api_key:';
 
 const activeJobControllers = new Map();
 const memoryJobs = new Map();
+const memoryFreeUsage = new Map();
+const memoryGenerationGrants = new Map();
+const memoryImageAPIKeys = new Map();
+
+function readPositiveInt(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload, null, 2);
@@ -149,6 +170,21 @@ function readInteger(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function readOptionalInteger(value) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function readStringOption(value, fallback = '') {
+  const text = String(value ?? '').trim();
+  return text || fallback;
+}
+
+function normalizeOutputSize(value, fallback = '') {
+  const text = String(value ?? '').trim().toLowerCase();
+  return /^\d{3,4}x\d{3,4}$/.test(text) ? text : fallback;
+}
+
 function getProviderKey(provider) {
   return `${provider.name}::${provider.url}`;
 }
@@ -258,8 +294,135 @@ function normalizeUserId(value) {
   return /^u_[a-z0-9-]{8,}$/i.test(userId) ? userId : '';
 }
 
+function normalizeSub2APIUserId(value) {
+  const parsed = Number.parseInt(String(value ?? '').trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? String(parsed) : '';
+}
+
 function normalizeProfileName(value) {
   return String(value || '').trim().slice(0, 40);
+}
+
+function getBearerToken(req, body) {
+  const authorization = String(req.headers.authorization || '').trim();
+  if (/^bearer\s+/i.test(authorization)) {
+    return authorization.replace(/^bearer\s+/i, '').trim();
+  }
+  const headerToken = String(req.headers['x-sub2api-token'] || req.headers['x-auth-token'] || '').trim();
+  if (headerToken) {
+    return headerToken;
+  }
+  return String(body?.token || body?.accessToken || '').trim();
+}
+
+function unwrapSub2APIResponse(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return payload;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'code') && payload.code !== 0) {
+    const error = new Error(payload.message || payload.reason || 'sub2api request failed');
+    error.sub2api = payload;
+    throw error;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'data')) {
+    return payload.data;
+  }
+  return payload;
+}
+
+async function readSub2APIResponse(response) {
+  const contentType = response.headers.get('content-type') || '';
+  const text = await response.text();
+  let payload = null;
+  if (contentType.includes('application/json') || text.trim().startsWith('{') || text.trim().startsWith('[')) {
+    payload = text ? JSON.parse(text) : null;
+  }
+
+  if (!response.ok) {
+    const message =
+      (payload && (payload.message || payload.reason || payload.error?.message || payload.error)) ||
+      text ||
+      `sub2api HTTP ${response.status}`;
+    const error = new Error(String(message));
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+
+  return payload ? unwrapSub2APIResponse(payload) : text;
+}
+
+async function sub2apiFetch(pathname, options = {}) {
+  const pathWithSlash = pathname.startsWith('/') ? pathname : `/${pathname}`;
+  const headers = {
+    ...(options.headers || {}),
+  };
+  const requestOptions = {
+    ...options,
+    headers,
+  };
+  delete requestOptions.token;
+  delete requestOptions.json;
+
+  if (options.token) {
+    headers.Authorization = `Bearer ${options.token}`;
+  }
+  if (options.json !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    requestOptions.body = JSON.stringify(options.json);
+  }
+
+  const response = await fetch(`${SUB2API_BASE_URL}${pathWithSlash}`, requestOptions);
+  return readSub2APIResponse(response);
+}
+
+function normalizeSub2APIUser(rawUser) {
+  const user = rawUser?.user || rawUser;
+  const id = normalizeSub2APIUserId(user?.id ?? user?.user_id);
+  if (!id) {
+    return null;
+  }
+  const profileName = String(user.username || user.email || `user-${id}`).trim();
+  return {
+    id,
+    role: 'account',
+    credits: 0,
+    email: user.email || '',
+    username: user.username || '',
+    profileName,
+  };
+}
+
+async function getSub2APIUser(token) {
+  if (!token) {
+    return null;
+  }
+  const data = await sub2apiFetch('/api/v1/auth/me', { method: 'GET', token });
+  const user = normalizeSub2APIUser(data);
+  if (!user) {
+    throw new Error('sub2api user not found');
+  }
+  return user;
+}
+
+async function resolveSub2APIContext(req, body) {
+  const store = await getQuotaStore();
+  const token = getBearerToken(req, body);
+  if (!token) {
+    return {
+      store,
+      token: '',
+      user: null,
+      userId: '',
+    };
+  }
+  const user = await getSub2APIUser(token);
+  return {
+    store,
+    token,
+    user,
+    userId: user.id,
+  };
 }
 
 function buildGuestUsageKey(userId, guestKey) {
@@ -331,6 +494,244 @@ async function migrateGuestUsageToUser(store, guestKey, userId) {
   }
 
   return mergedUsed;
+}
+
+function getFreeLimitForMode(mode) {
+  return mode === 'image' ? FREE_IMAGE_CLICKS : FREE_TEXT_CLICKS;
+}
+
+function buildFreeUsageKey(userId, mode) {
+  return `${FREE_USAGE_PREFIX}${userId}:${mode === 'image' ? 'image' : 'text'}`;
+}
+
+async function getFreeUsed(store, userId, mode) {
+  const key = buildFreeUsageKey(userId, mode);
+  if (store && typeof store.get === 'function') {
+    return Number((await store.get(key)) || 0);
+  }
+  return Number(memoryFreeUsage.get(key) || 0);
+}
+
+async function consumeFreeClick(store, userId, mode) {
+  const limit = getFreeLimitForMode(mode);
+  const key = buildFreeUsageKey(userId, mode);
+  const used = await getFreeUsed(store, userId, mode);
+  if (used >= limit) {
+    return { ok: false, used, remaining: 0, limit };
+  }
+  if (store && typeof store.incr === 'function') {
+    const nextUsed = Number(await store.incr(key));
+    return {
+      ok: nextUsed <= limit,
+      used: nextUsed,
+      remaining: Math.max(0, limit - nextUsed),
+      limit,
+    };
+  }
+  const nextUsed = used + 1;
+  memoryFreeUsage.set(key, nextUsed);
+  return {
+    ok: true,
+    used: nextUsed,
+    remaining: Math.max(0, limit - nextUsed),
+    limit,
+  };
+}
+
+async function getFreeStatus(store, userId) {
+  const textUsed = await getFreeUsed(store, userId, 'text');
+  const imageUsed = await getFreeUsed(store, userId, 'image');
+  return {
+    text: {
+      used: textUsed,
+      limit: FREE_TEXT_CLICKS,
+      remaining: Math.max(0, FREE_TEXT_CLICKS - textUsed),
+    },
+    image: {
+      used: imageUsed,
+      limit: FREE_IMAGE_CLICKS,
+      remaining: Math.max(0, FREE_IMAGE_CLICKS - imageUsed),
+    },
+  };
+}
+
+function buildGenerationGrantKey(grantId) {
+  return `${GENERATION_GRANT_PREFIX}${grantId}`;
+}
+
+async function saveGenerationGrant(store, grant) {
+  const key = buildGenerationGrantKey(grant.id);
+  const raw = JSON.stringify(grant);
+  if (store && typeof store.set === 'function') {
+    await store.set(key, raw, GENERATION_GRANT_TTL_SECONDS);
+  } else {
+    memoryGenerationGrants.set(key, {
+      raw,
+      expiresAt: Date.now() + GENERATION_GRANT_TTL_SECONDS * 1000,
+    });
+  }
+  return grant;
+}
+
+async function readGenerationGrant(store, grantId) {
+  const key = buildGenerationGrantKey(grantId);
+  if (store && typeof store.get === 'function') {
+    const raw = await store.get(key);
+    return parseStoredJob(raw);
+  }
+  const cached = memoryGenerationGrants.get(key);
+  if (!cached) {
+    return null;
+  }
+  if (cached.expiresAt <= Date.now()) {
+    memoryGenerationGrants.delete(key);
+    return null;
+  }
+  return parseStoredJob(cached.raw);
+}
+
+async function consumeGenerationGrant(store, grantId, userId, mode) {
+  const grant = await readGenerationGrant(store, grantId);
+  if (!grant) {
+    return null;
+  }
+  if (String(grant.userId) !== String(userId) || grant.mode !== mode) {
+    return null;
+  }
+  const allowedJobs = Number(grant.allowedJobs || 1);
+  const usedJobs = Number(grant.usedJobs || 0);
+  if (usedJobs >= allowedJobs) {
+    return null;
+  }
+  const nextGrant = {
+    ...grant,
+    usedJobs: usedJobs + 1,
+    lastUsedAt: Date.now(),
+  };
+  await saveGenerationGrant(store, nextGrant);
+  return grant;
+}
+
+async function createGenerationGrant(store, userId, mode, source, allowedJobs = 2) {
+  return saveGenerationGrant(store, {
+    id: createJobId(),
+    userId,
+    mode,
+    source,
+    allowedJobs,
+    usedJobs: 0,
+    createdAt: Date.now(),
+    lastUsedAt: null,
+  });
+}
+
+function buildImageAPIKeyCacheKey(userId) {
+  return `${IMAGE_API_KEY_PREFIX}${userId}`;
+}
+
+async function getCachedImageAPIKey(store, userId) {
+  const key = buildImageAPIKeyCacheKey(userId);
+  if (store && typeof store.get === 'function') {
+    const cached = await store.get(key);
+    return typeof cached === 'string' ? cached : '';
+  }
+  return memoryImageAPIKeys.get(key) || '';
+}
+
+async function setCachedImageAPIKey(store, userId, apiKey) {
+  const key = buildImageAPIKeyCacheKey(userId);
+  if (store && typeof store.set === 'function') {
+    await store.set(key, apiKey);
+  } else {
+    memoryImageAPIKeys.set(key, apiKey);
+  }
+}
+
+function getConfiguredImageGroupID() {
+  return Number.isFinite(SUB2API_IMAGE_GROUP_ID) && SUB2API_IMAGE_GROUP_ID > 0
+    ? SUB2API_IMAGE_GROUP_ID
+    : null;
+}
+
+async function resolveImageGroupID(token) {
+  const configured = getConfiguredImageGroupID();
+  if (configured) {
+    return configured;
+  }
+  const groups = await sub2apiFetch('/api/v1/groups/available', { method: 'GET', token });
+  const list = Array.isArray(groups) ? groups : [];
+  const group = list.find((item) => String(item.name || '').trim() === SUB2API_IMAGE_GROUP_NAME);
+  if (!group?.id) {
+    throw new Error(`未找到可用的${SUB2API_IMAGE_GROUP_NAME}订阅，请先兑换生图兑换码`);
+  }
+  return Number(group.id);
+}
+
+async function listImageAPIKeys(token, groupID) {
+  const path = `/api/v1/keys?page=1&page_size=50&group_id=${encodeURIComponent(String(groupID))}`;
+  const data = await sub2apiFetch(path, { method: 'GET', token });
+  const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
+  return items.filter((item) => item && item.group_id === groupID && item.status === 'active' && item.key);
+}
+
+async function ensureImageAPIKey(store, token, userId) {
+  const cached = await getCachedImageAPIKey(store, userId);
+  if (cached) {
+    return cached;
+  }
+
+  const groupID = await resolveImageGroupID(token);
+  const existingKeys = await listImageAPIKeys(token, groupID).catch(() => []);
+  const existing = existingKeys.find((item) => String(item.name || '').includes(SUB2API_IMAGE_API_KEY_NAME)) || existingKeys[0];
+  if (existing?.key) {
+    await setCachedImageAPIKey(store, userId, existing.key);
+    return existing.key;
+  }
+
+  const created = await sub2apiFetch('/api/v1/keys', {
+    method: 'POST',
+    token,
+    json: {
+      name: SUB2API_IMAGE_API_KEY_NAME,
+      group_id: groupID,
+    },
+  });
+  const apiKey = String(created?.key || '').trim();
+  if (!apiKey) {
+    throw new Error('生图 API Key 创建失败');
+  }
+  await setCachedImageAPIKey(store, userId, apiKey);
+  return apiKey;
+}
+
+async function hasImageAPIKeyAccess(store, token, userId) {
+  const cached = await getCachedImageAPIKey(store, userId);
+  if (cached) {
+    return true;
+  }
+  try {
+    const groupID = await resolveImageGroupID(token);
+    const existingKeys = await listImageAPIKeys(token, groupID).catch(() => []);
+    const existing = existingKeys.find((item) => String(item.name || '').includes(SUB2API_IMAGE_API_KEY_NAME)) || existingKeys[0];
+    if (existing?.key) {
+      await setCachedImageAPIKey(store, userId, existing.key);
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+async function redeemImageCode(store, token, userId, code) {
+  await sub2apiFetch('/api/v1/redeem', {
+    method: 'POST',
+    token,
+    json: { code },
+  });
+  await setCachedImageAPIKey(store, userId, '');
+  const apiKey = await ensureImageAPIKey(store, token, userId);
+  return apiKey;
 }
 
 async function saveUser(store, user) {
@@ -709,33 +1110,70 @@ function buildResponseEndpoints(provider) {
   return uniqueStrings(candidates);
 }
 
+function buildImageGenerationTool(requestConfig, hasInputImage, outputSize = '') {
+  const tool = {
+    type: 'image_generation',
+    model: readStringOption(requestConfig.imageModel, 'gpt-image-2'),
+    size: normalizeOutputSize(outputSize, readStringOption(requestConfig.size, '1024x1536')),
+    quality: readStringOption(requestConfig.quality, 'high'),
+    output_format: readStringOption(requestConfig.outputFormat, 'png'),
+    background: readStringOption(requestConfig.background, 'auto'),
+    moderation: readStringOption(requestConfig.moderation, 'auto'),
+  };
+
+  const action = readStringOption(requestConfig.action);
+  if (action) {
+    tool.action = action;
+  }
+
+  const outputCompression = readOptionalInteger(
+    requestConfig.outputCompression ?? requestConfig.output_compression ?? 100
+  );
+  if (outputCompression !== null) {
+    tool.output_compression = Math.max(0, Math.min(100, outputCompression));
+  }
+
+  const partialImages = readOptionalInteger(requestConfig.partialImages ?? requestConfig.partial_images);
+  if (partialImages !== null) {
+    tool.partial_images = Math.max(0, partialImages);
+  }
+
+  if (hasInputImage && !/^gpt-image-2$/i.test(String(tool.model || '').trim())) {
+    tool.input_fidelity = readStringOption(requestConfig.inputFidelity ?? requestConfig.input_fidelity, 'high');
+  }
+
+  return tool;
+}
+
 async function tryProvider(provider, prompt, requestConfig, options = {}) {
+  const inputImages = Array.isArray(options.inputImages)
+    ? options.inputImages.filter((image) => typeof image === 'string' && image.startsWith('data:image/')).slice(0, 4)
+    : [];
   const inputImage = typeof options.inputImage === 'string' && options.inputImage.startsWith('data:image/')
     ? options.inputImage
     : null;
+  const referenceImages = inputImages.length > 0 ? inputImages : (inputImage ? [inputImage] : []);
   const payload = {
     model: requestConfig.model || 'gpt-5.4',
-    input: inputImage
+    input: referenceImages.length > 0
       ? [
           {
             role: 'user',
             content: [
               { type: 'input_text', text: prompt },
-              { type: 'input_image', image_url: inputImage }
+              ...referenceImages.map((imageUrl) => ({ type: 'input_image', image_url: imageUrl }))
             ]
           }
         ]
       : prompt,
     tools: [
-      {
-        type: 'image_generation',
-        model: requestConfig.imageModel || 'gpt-image-2',
-        size: requestConfig.size || '1024x1536',
-        quality: requestConfig.quality || 'high',
-        output_format: requestConfig.outputFormat || 'png'
-      }
+      buildImageGenerationTool(requestConfig, referenceImages.length > 0, options.size || '')
     ],
     tool_choice: { type: 'image_generation' },
+    reasoning: {
+      effort: requestConfig.reasoningEffort || 'xhigh'
+    },
+    store: requestConfig.store !== false ? false : requestConfig.store,
     stream: true
   };
 
@@ -895,7 +1333,217 @@ async function tryProvider(provider, prompt, requestConfig, options = {}) {
   };
 }
 
+function extractImageBase64FromOpenAIResponse(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return '';
+  }
+  const direct = payload.data && Array.isArray(payload.data) ? payload.data[0] : null;
+  if (direct?.b64_json) {
+    return String(direct.b64_json);
+  }
+  if (direct?.url && /^data:image\/[^;]+;base64,/.test(direct.url)) {
+    return direct.url.replace(/^data:image\/[^;]+;base64,/, '');
+  }
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  for (const item of output) {
+    if (item?.type === 'image_generation_call' && item.result) {
+      return String(item.result);
+    }
+  }
+  return '';
+}
+
+function parseInputImageDataUrl(inputImage) {
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i.exec(String(inputImage || ''));
+  if (!match) {
+    return null;
+  }
+
+  const mimeType = match[1].toLowerCase();
+  const rawBase64 = match[2].replace(/\s/g, '');
+  const buffer = Buffer.from(rawBase64, 'base64');
+  if (buffer.length === 0) {
+    return null;
+  }
+
+  const subtype = mimeType.split('/')[1] || 'png';
+  const extension = subtype === 'jpeg' ? 'jpg' : subtype.replace(/[^a-z0-9]/g, '') || 'png';
+  return {
+    buffer,
+    mimeType,
+    filename: `input.${extension}`,
+  };
+}
+
+async function generateImageViaSub2API(prompt, options = {}) {
+  if (!options.apiKey) {
+    return {
+      ok: false,
+      statusCode: 403,
+      error: '缺少生图订阅权限',
+      attempts: [],
+    };
+  }
+
+  let endpoint = '/v1/images/generations';
+  try {
+    const inputImages = Array.isArray(options.inputImages)
+      ? options.inputImages.filter((image) => typeof image === 'string' && image.startsWith('data:image/')).slice(0, 4)
+      : [];
+    const inputImage = typeof options.inputImage === 'string' && options.inputImage.startsWith('data:image/')
+      ? options.inputImage
+      : null;
+    const referenceImages = inputImages.length > 0 ? inputImages : (inputImage ? [inputImage] : []);
+    const outputSize = normalizeOutputSize(options.size, SUB2API_IMAGE_SIZE);
+    const headers = {
+      Authorization: `Bearer ${options.apiKey}`,
+    };
+    let body;
+    if (referenceImages.length > 0) {
+      endpoint = '/v1/responses';
+      const requestConfig = readConfig().request || {};
+      headers['Content-Type'] = 'application/json';
+      headers.Accept = 'application/json';
+      body = JSON.stringify({
+        model: readStringOption(requestConfig.model, 'gpt-5.5'),
+        input: [
+          {
+            role: 'user',
+            content: [
+              { type: 'input_text', text: prompt },
+              ...referenceImages.map((imageUrl) => ({ type: 'input_image', image_url: imageUrl }))
+            ]
+          }
+        ],
+        tools: [
+          buildImageGenerationTool(
+            {
+              ...requestConfig,
+              imageModel: readStringOption(requestConfig.imageModel, SUB2API_IMAGE_MODEL),
+              size: outputSize,
+            },
+            true,
+            outputSize
+          )
+        ],
+        tool_choice: { type: 'image_generation' },
+        reasoning: {
+          effort: readStringOption(requestConfig.reasoningEffort, 'xhigh')
+        },
+        store: false,
+        stream: false,
+      });
+    } else {
+      headers['Content-Type'] = 'application/json';
+      body = JSON.stringify({
+        model: SUB2API_IMAGE_MODEL,
+        prompt,
+        n: 1,
+        size: outputSize,
+        response_format: 'b64_json',
+      });
+    }
+
+    const response = await fetch(`${SUB2API_BASE_URL}${endpoint}`, {
+      method: 'POST',
+      headers,
+      body,
+      signal: options.signal,
+    });
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : null;
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        statusCode: response.status,
+        error: data?.error?.message || data?.message || text || 'sub2api image generation failed',
+        attempts: [{
+          provider: 'sub2api',
+          endpoint,
+          ok: false,
+          status: response.status,
+          round: 1,
+          retry: 1,
+          retryable: isRetryableStatus(response.status),
+          error: data || text,
+        }],
+      };
+    }
+
+    const imageBase64 = extractImageBase64FromOpenAIResponse(data);
+    if (!imageBase64) {
+      return {
+        ok: false,
+        statusCode: 502,
+        error: 'sub2api 未返回图片数据',
+        attempts: [{
+          provider: 'sub2api',
+          endpoint,
+          ok: false,
+          status: response.status,
+          round: 1,
+          retry: 1,
+          retryable: true,
+          error: data,
+        }],
+      };
+    }
+
+    return {
+      ok: true,
+      buffer: Buffer.from(imageBase64, 'base64'),
+      provider: 'sub2api',
+      attempts: [{
+          provider: 'sub2api',
+          endpoint,
+          ok: true,
+        status: response.status,
+        round: 1,
+        retry: 1,
+        retryable: false,
+      }],
+      meta: {
+        responseId: data?.id || response.headers.get('x-request-id') || '',
+        finalCall: {
+          quality: '',
+          size: outputSize,
+        },
+      },
+    };
+  } catch (error) {
+    if (options.signal?.aborted || isAbortError(error)) {
+      return {
+        ok: false,
+        statusCode: 499,
+        error: 'Generation canceled',
+        attempts: [],
+        canceled: true,
+      };
+    }
+    return {
+      ok: false,
+      statusCode: 502,
+      error: String(error.message || error),
+      attempts: [{
+        provider: 'sub2api',
+        endpoint,
+        ok: false,
+        status: null,
+        round: 1,
+        retry: 1,
+        retryable: true,
+        error: String(error.message || error),
+      }],
+    };
+  }
+}
+
 async function generateImageWithFallback(prompt, options = {}) {
+  if (options.source === 'paid') {
+    return generateImageViaSub2API(prompt, options);
+  }
+
   const config = readConfig();
   const enabledProviders = config.providers.filter((provider) => provider.enabled !== false);
   const requestSignal = options.signal;
@@ -953,6 +1601,8 @@ async function generateImageWithFallback(prompt, options = {}) {
 
         const result = await tryProvider(provider, prompt, config.request, {
           inputImage: options.inputImage || null,
+          inputImages: options.inputImages || null,
+          size: options.size || '',
           signal: requestSignal
         });
         attempts.push({
@@ -1028,6 +1678,9 @@ async function handleGenerate(req, res) {
 
     const result = await generateImageWithFallback(prompt, {
       preferredProviders,
+      inputImage: typeof body.image === 'string' && body.image.startsWith('data:image/') ? body.image : null,
+      inputImages: Array.isArray(body.images) ? body.images : null,
+      size: normalizeOutputSize(body.size, ''),
       signal: requestAbort.signal
     });
 
@@ -1080,13 +1733,20 @@ async function handleGenerate(req, res) {
 
 async function createGenerateJob(prompt, preferredProviders, options = {}) {
   const now = Date.now();
+  const inputImages = Array.isArray(options.inputImages)
+    ? options.inputImages.filter((image) => typeof image === 'string' && image.startsWith('data:image/')).slice(0, 4)
+    : [];
+  const inputImage = inputImages[0] || options.inputImage || null;
   const job = {
     id: createJobId(),
     prompt,
     preferredProviders,
     userId: options.userId || null,
-    inputImage: options.inputImage || null,
-    mode: options.inputImage ? 'image' : 'text',
+    inputImage,
+    inputImages,
+    outputSize: normalizeOutputSize(options.size, ''),
+    mode: inputImage ? 'image' : 'text',
+    source: options.source || 'free',
     status: 'queued',
     createdAt: now,
     updatedAt: now,
@@ -1133,7 +1793,7 @@ async function cancelGenerateJob(jobId, reason = '生成任务已取消') {
   });
 }
 
-async function runGenerateJob(jobId) {
+async function runGenerateJob(jobId, runtimeOptions = {}) {
   const currentJob = await readJob(jobId);
   if (!currentJob || isTerminalJobStatus(currentJob.status)) {
     return currentJob;
@@ -1166,6 +1826,10 @@ async function runGenerateJob(jobId) {
     const result = await generateImageWithFallback(job.prompt, {
       preferredProviders: job.preferredProviders,
       inputImage: job.inputImage || null,
+      inputImages: job.inputImages || null,
+      size: job.outputSize || '',
+      source: job.source || 'free',
+      apiKey: runtimeOptions.apiKey || '',
       signal: controller.signal
     });
 
@@ -1271,27 +1935,53 @@ async function handleCreateGenerateJob(req, res) {
   try {
     const raw = await readRequestBody(req);
     const body = parseJsonBody(raw);
-    const context = await resolveAccessContext(req);
+    const context = await resolveSub2APIContext(req, body);
     const prompt = String(body.prompt || '').trim();
     const preferredProviders = normalizeProviderNames(body.preferredProviders);
-    const inputImage = typeof body.image === 'string' && body.image.startsWith('data:image/') ? body.image : null;
+    const inputImages = Array.isArray(body.images)
+      ? body.images.filter((image) => typeof image === 'string' && image.startsWith('data:image/')).slice(0, 4)
+      : [];
+    const fallbackImage = typeof body.image === 'string' && body.image.startsWith('data:image/') ? body.image : null;
+    const inputImage = inputImages[0] || fallbackImage;
+    const size = normalizeOutputSize(body.size, '');
+    const mode = inputImage ? 'image' : 'text';
+    const grantId = String(body.grantId || '').trim();
 
     if (!prompt) {
       sendJson(res, 400, { ok: false, error: 'prompt is required' });
       return;
     }
 
-    if (inputImage && !context.user) {
-      sendJson(res, 403, { ok: false, error: '图生图需要先创建账号', errorCode: 'account_required_for_image' });
+    if (!context.user) {
+      sendJson(res, 401, { ok: false, error: '请先登录或注册', errorCode: 'login_required' });
       return;
+    }
+
+    if (!grantId) {
+      sendJson(res, 403, { ok: false, error: '缺少生成授权，请重新点击生成', errorCode: 'generation_grant_required' });
+      return;
+    }
+
+    const grant = await consumeGenerationGrant(context.store, grantId, context.userId, mode);
+    if (!grant) {
+      sendJson(res, 403, { ok: false, error: '生成授权已失效，请重新点击生成', errorCode: 'generation_grant_invalid' });
+      return;
+    }
+
+    let apiKey = '';
+    if (grant.source === 'paid') {
+      apiKey = await ensureImageAPIKey(context.store, context.token, context.userId);
     }
 
     const job = await createGenerateJob(prompt, preferredProviders, {
       inputImage,
+      inputImages: inputImages.length > 0 ? inputImages : (inputImage ? [inputImage] : []),
+      size,
       userId: context.userId,
       store: context.store,
+      source: grant.source,
     });
-    runGenerateJob(job.id).catch((error) => {
+    runGenerateJob(job.id, { apiKey }).catch((error) => {
       console.error('[generate-job] unhandled failure', job.id, error);
     });
 
@@ -1317,7 +2007,7 @@ async function handleGetGenerateJob(req, res, jobId) {
       return;
     }
 
-    const context = await resolveAccessContext(req);
+    const context = await resolveSub2APIContext(req, {});
     if (job.userId && job.userId !== context.userId) {
       sendJson(res, 403, { ok: false, error: 'forbidden' });
       return;
@@ -1340,7 +2030,7 @@ async function handleGetGenerateJobImage(req, res, jobId) {
       return;
     }
 
-    const context = await resolveAccessContext(req);
+    const context = await resolveSub2APIContext(req, {});
     if (job.userId && job.userId !== context.userId) {
       sendJson(res, 403, { ok: false, error: 'forbidden' });
       return;
@@ -1366,7 +2056,7 @@ async function handleGetGenerateJobImage(req, res, jobId) {
 
 async function handleCancelGenerateJob(req, res, jobId) {
   try {
-    const context = await resolveAccessContext(req);
+    const context = await resolveSub2APIContext(req, {});
     const current = await readJob(jobId);
     if (current && current.userId && current.userId !== context.userId) {
       sendJson(res, 403, { ok: false, error: 'forbidden' });
@@ -1392,16 +2082,15 @@ async function handleSession(req, res) {
   try {
     const raw = await readRequestBody(req);
     const body = parseJsonBody(raw);
-    const store = await getQuotaStore();
-    const user = await ensureUser(store, body.userId);
+    const context = await resolveSub2APIContext(req, body);
+    if (!context.user) {
+      sendJson(res, 401, { ok: false, error: '请先登录或注册', errorCode: 'login_required' });
+      return;
+    }
     sendJson(res, 200, {
       ok: true,
-      user: {
-        id: user.id,
-        role: user.role,
-        credits: user.credits || 0,
-        profileName: user.profileName || null,
-      }
+      user: context.user,
+      free: await getFreeStatus(context.store, context.userId),
     });
   } catch (error) {
     sendJson(res, 500, { ok: false, error: String(error) });
@@ -1412,40 +2101,76 @@ async function handleRegister(req, res) {
   try {
     const raw = await readRequestBody(req);
     const body = parseJsonBody(raw);
-    const store = await getQuotaStore();
-    const user = await ensureUser(store, body.userId);
-    const profileName = normalizeProfileName(body.profileName || body.name || '');
-
-    if (!profileName) {
-      sendJson(res, 400, { ok: false, error: '请输入账号名称' });
+    const data = await sub2apiFetch('/api/v1/auth/register', {
+      method: 'POST',
+      json: {
+        email: String(body.email || '').trim(),
+        password: String(body.password || ''),
+        turnstile_token: String(body.turnstileToken || body.turnstile_token || ''),
+        promo_code: String(body.promoCode || body.promo_code || ''),
+        invitation_code: String(body.invitationCode || body.invitation_code || ''),
+      },
+    });
+    const token = String(data?.access_token || data?.accessToken || '').trim();
+    const user = normalizeSub2APIUser(data?.user);
+    if (!token || !user) {
+      sendJson(res, 502, { ok: false, error: 'sub2api 注册响应异常' });
       return;
     }
-
-    const nextUser = await updateUser(store, user.id, (current) => ({
-      ...current,
-      role: 'account',
-      profileName,
-    }));
-
-    await migrateGuestUsageToUser(store, fingerprint(req), nextUser.id);
-
     sendJson(res, 200, {
       ok: true,
-      user: {
-        id: nextUser.id,
-        role: nextUser.role,
-        credits: nextUser.credits || 0,
-        profileName: nextUser.profileName || null,
-      }
+      accessToken: token,
+      refreshToken: data?.refresh_token || '',
+      expiresIn: data?.expires_in || 0,
+      user,
     });
   } catch (error) {
-    sendJson(res, 500, { ok: false, error: String(error) });
+    sendJson(res, error.status || 500, { ok: false, error: String(error.message || error) });
+  }
+}
+
+async function handleLogin(req, res) {
+  try {
+    const raw = await readRequestBody(req);
+    const body = parseJsonBody(raw);
+    const data = await sub2apiFetch('/api/v1/auth/login', {
+      method: 'POST',
+      json: {
+        email: String(body.email || '').trim(),
+        password: String(body.password || ''),
+        turnstile_token: String(body.turnstileToken || body.turnstile_token || ''),
+      },
+    });
+    if (data?.requires_2fa) {
+      sendJson(res, 200, {
+        ok: true,
+        requires2FA: true,
+        tempToken: data.temp_token || '',
+        userEmailMasked: data.user_email_masked || '',
+      });
+      return;
+    }
+    const token = String(data?.access_token || data?.accessToken || '').trim();
+    const user = normalizeSub2APIUser(data?.user);
+    if (!token || !user) {
+      sendJson(res, 502, { ok: false, error: 'sub2api 登录响应异常' });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      accessToken: token,
+      refreshToken: data?.refresh_token || '',
+      expiresIn: data?.expires_in || 0,
+      user,
+    });
+  } catch (error) {
+    sendJson(res, error.status || 500, { ok: false, error: String(error.message || error) });
   }
 }
 
 async function handleUserJobs(req, res, userId) {
   try {
-    const context = await resolveAccessContext(req);
+    const context = await resolveSub2APIContext(req, {});
     if (!context.user || context.user.id !== userId) {
       sendJson(res, 403, { ok: false, error: 'forbidden' });
       return;
@@ -1581,58 +2306,52 @@ async function handleKeys(req, res) {
     const body = parseJsonBody(raw);
     const action = String(body.action || '').trim();
     const key = String(body.key || '').trim();
-    const context = await resolveAccessContext(req);
+    const context = await resolveSub2APIContext(req, body);
     const store = context.store;
 
-    if (!store) {
-      if (action === 'check_free') {
-        sendJson(res, 200, { free: true, mock: true });
-        return;
-      }
-
-      if (action === 'validate') {
-        sendJson(res, 200, { valid: true, mock: true });
-        return;
-      }
-
-      sendJson(res, 200, { ok: true, mock: true });
+    if (!context.user && !['import'].includes(action)) {
+      sendJson(res, 401, { ok: false, error: '请先登录或注册', errorCode: 'login_required' });
       return;
     }
 
     if (action === 'check_free') {
-      const freeQuota = await getEffectiveFreeQuota(store);
-      const used = Number((await store.get(buildGuestUsageKey(context.userId, context.guestKey))) || 0);
-      sendJson(res, 200, { free: used < freeQuota });
+      const mode = body.mode === 'image' ? 'image' : 'text';
+      const used = await getFreeUsed(store, context.userId, mode);
+      const limit = getFreeLimitForMode(mode);
+      sendJson(res, 200, {
+        free: used < limit,
+        used,
+        limit,
+        remaining: Math.max(0, limit - used),
+      });
       return;
     }
 
     if (action === 'consume_free') {
-      const freeQuota = await getEffectiveFreeQuota(store);
-      const freeKey = buildGuestUsageKey(context.userId, context.guestKey);
-      const used = Number((await store.get(freeKey)) || 0);
-
-      if (used >= freeQuota) {
-        sendJson(res, 403, { error: 'free_exhausted' });
+      const mode = body.mode === 'image' ? 'image' : 'text';
+      const consumed = await consumeFreeClick(store, context.userId, mode);
+      if (!consumed.ok) {
+        sendJson(res, 403, { error: 'free_exhausted', errorCode: 'free_exhausted', ...consumed });
         return;
       }
-
-      await store.incr(freeKey);
-      sendJson(res, 200, { ok: true });
+      const grant = await createGenerationGrant(store, context.userId, mode, 'free', IMAGES_PER_CLICK);
+      sendJson(res, 200, { ok: true, grantId: grant.id, ...consumed });
       return;
     }
 
     if (action === 'status') {
-      const freeQuota = await getEffectiveFreeQuota(store);
+      const free = await getFreeStatus(store, context.userId);
+      let hasPaidAccess = false;
+      try {
+        hasPaidAccess = await hasImageAPIKeyAccess(store, context.token, context.userId);
+      } catch {
+        hasPaidAccess = false;
+      }
       sendJson(res, 200, {
-        freeQuota,
-        user: context.user
-          ? {
-              id: context.user.id,
-              role: context.user.role,
-              credits: context.user.credits || 0,
-              profileName: context.user.profileName || null,
-            }
-          : null,
+        free,
+        freeQuota: FREE_TEXT_CLICKS,
+        hasPaidAccess,
+        user: context.user,
       });
       return;
     }
@@ -1643,59 +2362,29 @@ async function handleKeys(req, res) {
         return;
       }
 
-      const exists = await store.sismember(KEYS_SET, key);
-      sendJson(res, 200, { valid: !!exists });
+      sendJson(res, 200, { valid: true });
       return;
     }
 
     if (action === 'consume') {
-      if (!context.user) {
-        sendJson(res, 403, { error: '请先创建账号再使用密钥' });
-        return;
-      }
-
       if (!key) {
         sendJson(res, 400, { error: '请输入密钥' });
         return;
       }
 
-      const removed = await store.srem(KEYS_SET, key);
-      if (!removed) {
-        sendJson(res, 403, { error: '密钥无效或已使用' });
-        return;
-      }
-
-      await updateUser(store, context.user.id, (current) => ({
-        ...current,
-        credits: Number(current.credits || 0) + ACCOUNT_CREDIT_PER_KEY,
-      }));
-
-      sendJson(res, 200, { ok: true, creditsAdded: ACCOUNT_CREDIT_PER_KEY });
+      await redeemImageCode(store, context.token, context.userId, key);
+      sendJson(res, 200, { ok: true, hasPaidAccess: true });
       return;
     }
 
     if (action === 'consume_credit') {
-      if (!context.user) {
-        sendJson(res, 403, { error: '请先创建账号' });
-        return;
-      }
-
-      const current = await readUser(store, context.user.id);
-      const credits = Number(current?.credits || 0);
-
-      if (credits <= 0) {
-        sendJson(res, 403, { error: 'credits_exhausted', errorCode: 'credits_exhausted' });
-        return;
-      }
-
-      const nextUser = await updateUser(store, context.user.id, (user) => ({
-        ...user,
-        credits: Math.max(0, Number(user.credits || 0) - 1),
-      }));
-
+      const mode = body.mode === 'image' ? 'image' : 'text';
+      await ensureImageAPIKey(store, context.token, context.userId);
+      const grant = await createGenerationGrant(store, context.userId, mode, 'paid', IMAGES_PER_CLICK);
       sendJson(res, 200, {
         ok: true,
-        credits: Number(nextUser.credits || 0),
+        grantId: grant.id,
+        hasPaidAccess: true,
       });
       return;
     }
@@ -1806,6 +2495,11 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && parsedUrl.pathname === '/api/session') {
     await handleSession(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && parsedUrl.pathname === '/api/session/login') {
+    await handleLogin(req, res);
     return;
   }
 
